@@ -1607,7 +1607,7 @@ scan_malware_viruses() {
     # chkrootkit
     if check_tool chkrootkit; then
         echo "  chkrootkit: installed"
-        local chkroot_result=$(safe_cmd 60 chkrootkit 2>/dev/null | grep -i "infected\\|not found\" || echo "clean")
+        local chkroot_result=$(safe_cmd 60 chkrootkit 2>/dev/null | grep -iE "infected|not found" || echo "clean")
         if [[ "$chkroot_result" != "clean" ]]; then
             echo "  chkrootkit_status: SUSPECTED"
             add_issue "CRITICAL" "Возможное заражение rootkit" "security" "Запустить глубокую проверку, изолировать систему"
@@ -1699,7 +1699,7 @@ scan_malware_viruses() {
     echo "• DATA:"
     
     if check_tool ss; then
-        local weird_ports=$(safe_cmd 10 ss -tulpn 2>/dev/null | grep -E ":[0-9]{5}|LISTEN.*0\\.0\\.0\\.0.*:(22|80|443)\" | grep -v \":22 \" | head -20 || echo "")
+        local weird_ports=$(safe_cmd 10 ss -tulpn 2>/dev/null | grep -E ":[0-9]{5}|LISTEN.*0\.0\.0\.0.*:(22|80|443)" | grep -v ":22 " | head -20 || echo "")
         if [[ -n "$weird_ports" ]]; then
             echo "  unusual_listeners: detected"
             echo "$weird_ports" | while read -r line; do echo "  $line"; done
@@ -1815,12 +1815,13 @@ generate_ai_summary() {
 # ОПРЕДЕЛЕНИЕ ПУТИ СОХРАНЕНИЯ ОТЧЁТА
 #-------------------------------------------------------------------------------
 determine_output_path() {
-    # Приоритетные директории
+    # Приоритетные директории - ВСЕГДА пытаемся использовать Desktop
     local dirs_to_try=(
         "$HOME/Desktop"
         "$HOME/Рабочий_стол"
-        "$HOME"
     )
+    
+    TARGET_DIR=""
     
     for dir in "${dirs_to_try[@]}"; do
         if [[ -d "$dir" ]]; then
@@ -1829,16 +1830,26 @@ determine_output_path() {
         fi
     done
     
-    # Если ни одна не существует, пробуем создать Desktop
+    # Если ни одна не существует, ВСЕГДА создаём Desktop
     if [[ -z "$TARGET_DIR" ]]; then
         TARGET_DIR="$HOME/Desktop"
-        if ! mkdir -p "$TARGET_DIR" 2>/dev/null; then
-            echo -e "${COLOR_YELLOW}⚠️ Не удалось создать $TARGET_DIR, использую $HOME${COLOR_RESET}"
-            TARGET_DIR="$HOME"
+        if mkdir -p "$TARGET_DIR" 2>/dev/null; then
+            echo -e "${COLOR_GREEN}✅ Создана директория: $TARGET_DIR${COLOR_RESET}"
+        else
+            # Если не удалось создать Desktop, пробуем Рабочий_стол
+            TARGET_DIR="$HOME/Рабочий_стол"
+            if mkdir -p "$TARGET_DIR" 2>/dev/null; then
+                echo -e "${COLOR_GREEN}✅ Создана директория: $TARGET_DIR${COLOR_RESET}"
+            else
+                # В крайнем случае используем HOME, но с предупреждением
+                echo -e "${COLOR_YELLOW}⚠️ Не удалось создать директорию на рабочем столе, использую $HOME${COLOR_RESET}"
+                TARGET_DIR="$HOME"
+            fi
         fi
     fi
     
     OUTPUT_FILE="$TARGET_DIR/$OUTPUT_FILENAME"
+    echo -e "${COLOR_BLUE}📁 Отчёт будет сохранён в: $OUTPUT_FILE${COLOR_RESET}"
 }
 
 #-------------------------------------------------------------------------------
