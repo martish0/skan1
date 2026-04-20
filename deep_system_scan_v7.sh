@@ -1072,6 +1072,336 @@ scan_package_management() {
     esac
 }
 
+#-------------------------------------------------------------------------------
+# scan_all_installed_packages - Полный список всех установленных пакетов
+# Уровень: 2 (Средний)
+#-------------------------------------------------------------------------------
+scan_all_installed_packages() {
+    local level_required=$LEVEL_MEDIUM
+    [[ $SCAN_LEVEL -lt $level_required ]] && return 0
+    
+    echo ""
+    echo "## [ALL_INSTALLED_PACKAGES]"
+    echo "### PACKAGE_LIST"
+    echo "• STATUS: OK"
+    echo "• DATA:"
+    echo "  format: one_package_per_line"
+    echo "• RAW_LOGS:"
+    
+    detect_package_manager
+    
+    case "$PKG_MGR" in
+        apt|dpkg)
+            # Debian/Ubuntu - dpkg list
+            safe_cmd 30 dpkg-query -W -f='${Package} ${Version} ${Status}\n' 2>/dev/null | grep "install ok installed" | cut -d' ' -f1,2 || echo "[NO_PACKAGES_FOUND]"
+            ;;
+        dnf|yum|rpm)
+            # RHEL/Fedora - rpm list
+            safe_cmd 30 rpm -qa --last 2>/dev/null | head -500 || echo "[NO_PACKAGES_FOUND]"
+            ;;
+        pacman)
+            # Arch Linux - pacman list
+            safe_cmd 30 pacman -Q 2>/dev/null | head -500 || echo "[NO_PACKAGES_FOUND]"
+            ;;
+        zypper)
+            # openSUSE - zypper list
+            safe_cmd 30 zypper search --installed-only 2>/dev/null | tail -n +5 | head -500 || echo "[NO_PACKAGES_FOUND]"
+            ;;
+        *)
+            echo "[UNKNOWN_PACKAGE_MANAGER]"
+            ;;
+    esac
+}
+
+#-------------------------------------------------------------------------------
+# scan_all_installed_drivers - Полный список всех установленных драйверов
+# Уровень: 2 (Средний)
+#-------------------------------------------------------------------------------
+scan_all_installed_drivers() {
+    local level_required=$LEVEL_MEDIUM
+    [[ $SCAN_LEVEL -lt $level_required ]] && return 0
+    
+    echo ""
+    echo "## [ALL_INSTALLED_DRIVERS]"
+    echo "### KERNEL_MODULES_DRIVERS"
+    echo "• STATUS: OK"
+    echo "• DATA:"
+    echo "  format: MODULE_NAME | VERSION | LICENSE | DESCRIPTION"
+    echo "• RAW_LOGS:"
+    
+    # Загруженные модули ядра
+    echo "# Загруженные модули ядра (drivers):"
+    safe_cmd 15 lsmod 2>/dev/null | tail -n +2 | while read -r module size used_by; do
+        local mod_info=$(safe_cmd 5 modinfo "$module" 2>/dev/null || echo "")
+        local version=$(echo "$mod_info" | grep "^version:" | head -1 | awk '{print $2}')
+        local license=$(echo "$mod_info" | grep "^license:" | head -1 | awk '{print $2}')
+        local desc=$(echo "$mod_info" | grep "^description:" | head -1 | cut -d':' -f2- | xargs)
+        version=${version:-unknown}
+        license=${license:-unknown}
+        desc=${desc:-no_description}
+        echo "  $module | $version | $license | $desc"
+    done
+    
+    echo ""
+    echo "### GPU_DRIVERS"
+    echo "• DATA:"
+    
+    # NVIDIA драйверы
+    if check_tool nvidia-smi; then
+        echo "  NVIDIA_DRIVER: $(safe_cmd 5 nvidia-smi --query-gpu=driver_version --format=csv,noheader 2>/dev/null | head -1 || echo "[NOT_FOUND]")"
+    else
+        echo "  NVIDIA_DRIVER: [NOT_INSTALLED]"
+    fi
+    
+    # AMD GPU
+    if safe_cmd 5 lspci -nn 2>/dev/null | grep -i "vga.*amd\|vga.*ati\|display.*amd" >/dev/null; then
+        local amdgpu_loaded=$(safe_cmd 5 lsmod | grep -c amdgpu || echo "0")
+        echo "  AMDGPU_MODULE: ${amdgpu_loaded}_loaded"
+    fi
+    
+    # Intel GPU
+    if safe_cmd 5 lspci -nn 2>/dev/null | grep -i "vga.*intel\|display.*intel" >/dev/null; then
+        local i915_loaded=$(safe_cmd 5 lsmod | grep -c i915 || echo "0")
+        echo "  I915_MODULE: ${i915_loaded}_loaded"
+    fi
+    
+    echo ""
+    echo "### WIFI_NETWORK_DRIVERS"
+    echo "• DATA:"
+    
+    # Wireless драйверы
+    safe_cmd 10 lspci -k 2>/dev/null | grep -A3 -i network | grep -E "Kernel driver in use|Kernel modules" | while read -r line; do
+        echo "  $line"
+    done
+    
+    # USB WiFi адаптеры
+    safe_cmd 10 lsusb 2>/dev/null | grep -i wireless | while read -r line; do
+        echo "  USB_WIFI: $line"
+    done
+    
+    echo ""
+    echo "### DKMS_MODULES"
+    echo "• DATA:"
+    
+    if check_tool dkms; then
+        safe_cmd 15 dkms status 2>/dev/null | while read -r line; do
+            echo "  DKMS: $line"
+        done
+    else
+        echo "  DKMS: [NOT_INSTALLED]"
+    fi
+    
+    echo ""
+    echo "### FIRMWARE_BLOBS"
+    echo "• DATA:"
+    
+    if [[ -d /lib/firmware ]]; then
+        local fw_count=$(safe_cmd 10 find /lib/firmware -type f 2>/dev/null | wc -l || echo "0")
+        echo "  firmware_files_count: $fw_count"
+        echo "  firmware_path: /lib/firmware"
+    else
+        echo "  firmware_path: [NOT_FOUND]"
+    fi
+}
+
+#-------------------------------------------------------------------------------
+# scan_broken_packages_deps - Список всех сломанных пакетов и зависимостей
+# Уровень: 2 (Средний)
+#-------------------------------------------------------------------------------
+scan_broken_packages_deps() {
+    local level_required=$LEVEL_MEDIUM
+    [[ $SCAN_LEVEL -lt $level_required ]] && return 0
+    
+    echo ""
+    echo "## [BROKEN_PACKAGES_DEPENDENCIES]"
+    echo "### BROKEN_PACKAGES_DETECT"
+    echo "• STATUS: OK"
+    echo "• DATA:"
+    
+    detect_package_manager
+    local broken_found=0
+    
+    case "$PKG_MGR" in
+        apt|dpkg)
+            echo "  manager: apt/dpkg"
+            echo ""
+            echo "### DPKG_AUDIT"
+            
+            local dpkg_audit=$(safe_cmd 30 dpkg --audit 2>/dev/null)
+            if [[ -n "$dpkg_audit" ]]; then
+                echo "• STATUS: WARNING"
+                echo "• RAW_LOGS:"
+                echo "$dpkg_audit" | while read -r line; do
+                    echo "  $line"
+                done
+                broken_found=1
+                add_issue "WARNING" "Битые пакеты в dpkg audit" "apt" "sudo apt --fix-broken install"
+            else
+                echo "  dpkg_audit: [CLEAN]"
+            fi
+            
+            echo ""
+            echo "### APT_BROKEN"
+            
+            local apt_broken=$(safe_cmd 30 apt-get check 2>&1 | grep -v "^Reading" || echo "")
+            if [[ -n "$apt_broken" ]]; then
+                echo "• STATUS: WARNING"
+                echo "• RAW_LOGS:"
+                echo "$apt_broken" | while read -r line; do
+                    echo "  $line"
+                done
+                broken_found=1
+                add_issue "WARNING" "Ошибки зависимостей apt" "apt" "sudo apt --fix-broken install"
+            else
+                echo "  apt_check: [CLEAN]"
+            fi
+            
+            echo ""
+            echo "### HELD_PACKAGES"
+            
+            local held=$(safe_cmd 10 apt-mark showhold 2>/dev/null)
+            if [[ -n "$held" ]]; then
+                echo "• DATA:"
+                echo "  held_packages:"
+                echo "$held" | while read -r pkg; do
+                    echo "    - $pkg"
+                done
+            else
+                echo "  held_packages: [NONE]"
+            fi
+            ;;
+            
+        dnf|yum)
+            echo "  manager: dnf/yum"
+            echo ""
+            echo "### DNF_VERIFY"
+            
+            local dnf_verify=$(safe_cmd 60 dnf verify 2>/dev/null | grep "FAILED" || echo "")
+            if [[ -n "$dnf_verify" ]]; then
+                echo "• STATUS: WARNING"
+                echo "• RAW_LOGS:"
+                echo "$dnf_verify" | head -50 | while read -r line; do
+                    echo "  $line"
+                done
+                broken_found=1
+                add_issue "WARNING" "Ошибки верификации dnf" "dnf" "sudo dnf check"
+            else
+                echo "  dnf_verify: [CLEAN]"
+            fi
+            
+            echo ""
+            echo "### DNF_PROBLEMS"
+            
+            local dnf_problems=$(safe_cmd 30 dnf check 2>&1 | grep -iE "error|problem|broken" || echo "")
+            if [[ -n "$dnf_problems" ]]; then
+                echo "• STATUS: WARNING"
+                echo "• RAW_LOGS:"
+                echo "$dnf_problems" | head -50 | while read -r line; do
+                    echo "  $line"
+                done
+                broken_found=1
+            else
+                echo "  dnf_check: [CLEAN]"
+            fi
+            ;;
+            
+        pacman)
+            echo "  manager: pacman"
+            echo ""
+            echo "### PACMAN_CHECK"
+            
+            local pacman_check=$(safe_cmd 30 pacman -Qk 2>/dev/null | grep -v "ok$" || echo "")
+            if [[ -n "$pacman_check" ]]; then
+                echo "• STATUS: WARNING"
+                echo "• RAW_LOGS:"
+                echo "$pacman_check" | head -100 | while read -r line; do
+                    echo "  $line"
+                done
+                broken_found=1
+                add_issue "WARNING" "Ошибки проверки pacman" "pacman" "sudo pacman -Syu"
+            else
+                echo "  pacman_check: [CLEAN]"
+            fi
+            
+            echo ""
+            echo "### ORPHANED_PACKAGES"
+            
+            local orphaned=$(safe_cmd 10 pacman -Qdtq 2>/dev/null)
+            if [[ -n "$orphaned" ]]; then
+                echo "• DATA:"
+                echo "  orphaned_packages:"
+                echo "$orphaned" | head -50 | while read -r pkg; do
+                    echo "    - $pkg"
+                done
+            else
+                echo "  orphaned_packages: [NONE]"
+            fi
+            ;;
+            
+        zypper)
+            echo "  manager: zypper"
+            echo ""
+            echo "### ZYPPER_VERIFY"
+            
+            local zypper_verify=$(safe_cmd 60 zypper verify 2>/dev/null | grep -iE "error|broken|missing" || echo "")
+            if [[ -n "$zypper_verify" ]]; then
+                echo "• STATUS: WARNING"
+                echo "• RAW_LOGS:"
+                echo "$zypper_verify" | head -50 | while read -r line; do
+                    echo "  $line"
+                done
+                broken_found=1
+            else
+                echo "  zypper_verify: [CLEAN]"
+            fi
+            ;;
+            
+        *)
+            echo "  manager: [UNKNOWN]"
+            echo "  broken_check: [SKIPPED_UNKNOWN_MANAGER]"
+            ;;
+    esac
+    
+    echo ""
+    echo "### MISSING_SHARED_LIBRARIES"
+    echo "• DATA:"
+    
+    # Проверка отсутствующих библиотек через ldconfig
+    local missing_libs=$(safe_cmd 30 ldconfig -p 2>/dev/null | wc -l || echo "0")
+    echo "  available_libraries_in_ldconfig: $missing_libs"
+    
+    # Проверка битых ссылок на библиотеки в установленных бинарниках
+    if check_tool ldd; then
+        local broken_ldd=$(safe_cmd 60 find /usr/bin /usr/sbin /bin /sbin -type f -executable 2>/dev/null | head -100 | xargs -I {} sh -c 'ldd "{}" 2>/dev/null | grep -q "not found" && echo "{}"' | head -20 || echo "")
+        if [[ -n "$broken_ldd" ]]; then
+            echo "• STATUS: WARNING"
+            echo "  binaries_with_missing_libs:"
+            echo "$broken_ldd" | while read -r bin; do
+                echo "    - $bin"
+                ldd "$bin" 2>/dev/null | grep "not found" | head -3 | while read -r lib_line; do
+                    echo "      missing: $lib_line"
+                done
+            done
+            broken_found=1
+            add_issue "WARNING" "Бинарники с отсутствующими библиотеками" "ldd" "Переустановить соответствующие пакеты"
+        else
+            echo "  binaries_with_missing_libs: [NONE]"
+        fi
+    fi
+    
+    # Итоговый статус
+    echo ""
+    echo "### SUMMARY"
+    if [[ $broken_found -eq 0 ]]; then
+        echo "• STATUS: OK"
+        echo "  overall_status: [NO_BROKEN_PACKAGES_FOUND]"
+    else
+        echo "• STATUS: WARNING"
+        echo "  overall_status: [BROKEN_PACKAGES_DETECTED]"
+        add_issue "WARNING" "Обнаружены проблемы с пакетами или зависимостями" "package_manager" "Выполнить проверку и восстановление пакетов"
+    fi
+}
+
 scan_containers_virt() {
     local level_required=$LEVEL_TOTAL
     [[ $SCAN_LEVEL -lt $level_required ]] && return 0
@@ -1516,6 +1846,18 @@ run_scan() {
         print_progress "Управление пакетами" "RUNNING"
         scan_package_management
         print_progress "Управление пакетами" "OK"
+        
+        print_progress "Все установленные пакеты" "RUNNING"
+        scan_all_installed_packages
+        print_progress "Все установленные пакеты" "OK"
+        
+        print_progress "Все установленные драйверы" "RUNNING"
+        scan_all_installed_drivers
+        print_progress "Все установленные драйверы" "OK"
+        
+        print_progress "Сломанные пакеты и зависимости" "RUNNING"
+        scan_broken_packages_deps
+        print_progress "Сломанные пакеты и зависимости" "OK"
     fi
     
     # === TOTAL LEVEL ===
