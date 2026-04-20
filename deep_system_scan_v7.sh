@@ -1,8 +1,8 @@
 #!/bin/bash
 #===============================================================================
-# DEEP SYSTEM SCAN v7 - Производственный диагностический инструмент
+# DEEP SYSTEM SCAN v7.1 - Производственный диагностический инструмент
 # READ-ONLY сканирование системы с генерацией отчёта для ИИ-анализа
-# Версия: 7.0 | Лицензия: MIT | Автор: Senior Linux Engineer
+# Версия: 7.1 | Лицензия: MIT | Автор: Senior Linux Engineer
 #===============================================================================
 
 #-------------------------------------------------------------------------------
@@ -11,7 +11,7 @@
 set -o pipefail
 # set -e НЕ используется для продолжения сканирования при ошибках
 
-readonly SCRIPT_VERSION="7.0"
+readonly SCRIPT_VERSION="7.1"
 readonly SCRIPT_NAME="deep_system_scan_v7.sh"
 readonly TIMESTAMP=$(date +%Y%m%d_%H%M%S)
 readonly HOSTNAME_SHORT=$(hostname -s 2>/dev/null || echo "unknown")
@@ -1070,6 +1070,323 @@ scan_package_management() {
             echo "  package_management: [UNKNOWN_MANAGER]"
             ;;
     esac
+}
+
+#-------------------------------------------------------------------------------
+# scan_connected_repositories - Сканирование подключенных репозиториев
+# Уровень: 2 (Средний)
+#-------------------------------------------------------------------------------
+scan_connected_repositories() {
+    local level_required=$LEVEL_MEDIUM
+    [[ $SCAN_LEVEL -lt $level_required ]] && return 0
+    
+    echo ""
+    echo "## [CONNECTED_REPOSITORIES]"
+    echo "### REPOSITORY_SCAN_SUMMARY"
+    
+    echo "• STATUS: OK"
+    echo "• DATA:"
+    
+    local repos_found=0
+    local repos_available=0
+    
+    # === GIT РЕПОЗИТОРИИ ===
+    echo ""
+    echo "### GIT_REPOSITORIES"
+    echo "• DATA:"
+    
+    local git_repos=()
+    local common_dirs=("$HOME" "$HOME/projects" "$HOME/workspace" "$HOME/dev" "$HOME/src" "/opt" "/var/www")
+    
+    for dir in "${common_dirs[@]}"; do
+        if [[ -d "$dir" ]]; then
+            while IFS= read -r -d '' repo; do
+                git_repos+=("$repo")
+            done < <(find "$dir" -maxdepth 3 -type d -name ".git" -print0 2>/dev/null)
+        fi
+    done
+    
+    if [[ ${#git_repos[@]} -gt 0 ]]; then
+        echo "  git_repos_found: ${#git_repos[@]}"
+        echo "• RAW_LOGS: [TRUNCATED: first 50]"
+        local count=0
+        for repo_path in "${git_repos[@]}"; do
+            [[ $count -ge 50 ]] && break
+            local repo_dir=$(dirname "$repo_path")
+            local repo_name=$(basename "$repo_dir")
+            
+            # Получаем информацию о remote origin если есть доступ
+            local remote_url=""
+            if [[ -d "$repo_path" ]]; then
+                remote_url=$(safe_cmd 5 git -C "$repo_dir" remote get-url origin 2>/dev/null || echo "[NO_REMOTE]")
+            fi
+            
+            echo "  • $repo_name | path: $repo_dir | origin: $remote_url"
+            ((count++))
+            ((repos_found++))
+        done
+        
+        if [[ ${#git_repos[@]} -gt 50 ]]; then
+            echo "  ... и ещё $((${#git_repos[@]} - 50)) репозиториев"
+        fi
+    else
+        echo "  git_repos_found: 0"
+        echo "  status: [NO_GIT_REPOS_FOUND]"
+    fi
+    
+    # Проверка наличия git
+    if ! check_tool git; then
+        echo "  git_tool: [NOT_INSTALLED]"
+        add_issue "INFO" "Git не установлен" "tools" "Установить: sudo $PKG_MGR install git"
+    fi
+    
+    # === DOCKER РЕПОЗИТОРИИ/ОБРАЗЫ ===
+    echo ""
+    echo "### DOCKER_REPOSITORIES"
+    echo "• DATA:"
+    
+    if check_tool docker; then
+        if sudo -n true 2>/dev/null || groups | grep -q docker; then
+            local docker_images=$(safe_cmd 30 docker images --format "{{.Repository}}:{{.Tag}}" 2>/dev/null | head -50 || echo "")
+            local docker_containers=$(safe_cmd 15 docker ps -a --format "{{.Names}} ({{.Status}})" 2>/dev/null | head -20 || echo "")
+            local docker_volumes=$(safe_cmd 15 docker volume ls --format "{{.Name}}" 2>/dev/null | head -20 || echo "")
+            
+            if [[ -n "$docker_images" ]]; then
+                local img_count=$(echo "$docker_images" | wc -l)
+                echo "  docker_images_found: $img_count"
+                echo "• RAW_LOGS: [TRUNCATED: first 50]"
+                echo "$docker_images" | while read -r line; do echo "  • $line"; done
+                ((repos_found += img_count))
+            else
+                echo "  docker_images_found: 0"
+            fi
+            
+            if [[ -n "$docker_containers" ]]; then
+                local cont_count=$(echo "$docker_containers" | wc -l)
+                echo "  docker_containers: $cont_count"
+                echo "• RAW_LOGS: [TRUNCATED: first 20]"
+                echo "$docker_containers" | while read -r line; do echo "  • $line"; done
+            fi
+            
+            if [[ -n "$docker_volumes" ]]; then
+                local vol_count=$(echo "$docker_volumes" | wc -l)
+                echo "  docker_volumes: $vol_count"
+            fi
+        else
+            echo "  docker_access: [NEEDS_ROOT_OR_DOCKER_GROUP]"
+            add_issue "WARNING" "Нет доступа к Docker" "permissions" "Добавить пользователя в группу docker: sudo usermod -aG docker \$USER"
+        fi
+    else
+        echo "  docker_tool: [NOT_INSTALLED]"
+        echo "  status: Docker не установлен"
+        ((repos_available++))
+    fi
+    
+    # === SNAP ПАКЕТЫ/РЕПОЗИТОРИИ ===
+    echo ""
+    echo "### SNAP_PACKAGES"
+    echo "• DATA:"
+    
+    if check_tool snap; then
+        if sudo -n true 2>/dev/null; then
+            local snap_list=$(safe_cmd 20 snap list 2>/dev/null | tail -n +2 | head -50 || echo "")
+            
+            if [[ -n "$snap_list" ]]; then
+                local snap_count=$(echo "$snap_list" | wc -l)
+                echo "  snap_packages_found: $snap_count"
+                echo "• RAW_LOGS: [TRUNCATED: first 50]"
+                echo "$snap_list" | while read -r line; do echo "  • $line"; done
+                ((repos_found += snap_count))
+            else
+                echo "  snap_packages_found: 0"
+            fi
+        else
+            echo "  snap_access: [NEEDS_ROOT]"
+        fi
+    else
+        echo "  snap_tool: [NOT_INSTALLED]"
+        echo "  status: Snap не установлен"
+        ((repos_available++))
+    fi
+    
+    # === FLATPAK ПРИЛОЖЕНИЯ ===
+    echo ""
+    echo "### FLATPAK_APPLICATIONS"
+    echo "• DATA:"
+    
+    if check_tool flatpak; then
+        local flatpak_apps=$(safe_cmd 20 flatpak list --app --columns=application,version,origin 2>/dev/null | head -50 || echo "")
+        local flatpak_remotes=$(safe_cmd 15 flatpak remotes 2>/dev/null | tail -n +2 || echo "")
+        
+        if [[ -n "$flatpak_apps" ]]; then
+            local fp_count=$(echo "$flatpak_apps" | wc -l)
+            echo "  flatpak_apps_found: $fp_count"
+            echo "• RAW_LOGS: [TRUNCATED: first 50]"
+            echo "$flatpak_apps" | while read -r line; do echo "  • $line"; done
+            ((repos_found += fp_count))
+        else
+            echo "  flatpak_apps_found: 0"
+        fi
+        
+        if [[ -n "$flatpak_remotes" ]]; then
+            local remote_count=$(echo "$flatpak_remotes" | wc -l)
+            echo "  flatpak_remotes: $remote_count"
+            echo "• RAW_LOGS:"
+            echo "$flatpak_remotes" | while read -r line; do echo "  • $line"; done
+        fi
+    else
+        echo "  flatpak_tool: [NOT_INSTALLED]"
+        echo "  status: Flatpak не установлен"
+        ((repos_available++))
+    fi
+    
+    # === APT РЕПОЗИТОРИИ (для Debian/Ubuntu) ===
+    echo ""
+    echo "### APT_REPOSITORIES"
+    echo "• DATA:"
+    
+    detect_package_manager
+    if [[ "$PKG_MGR" == "apt" ]]; then
+        if [[ -d /etc/apt/sources.list.d ]]; then
+            local apt_sources=$(safe_cmd 10 find /etc/apt/sources.list.d -name "*.list" -type f 2>/dev/null | head -20 || echo "")
+            local main_source=$(safe_cmd 5 cat /etc/apt/sources.list 2>/dev/null | grep -v "^#" | grep -v "^$" | head -10 || echo "")
+            
+            local apt_repo_count=0
+            if [[ -n "$apt_sources" ]]; then
+                apt_repo_count=$(echo "$apt_sources" | wc -l)
+                echo "  apt_sources_files: $apt_repo_count"
+                echo "• RAW_LOGS: [FILES]"
+                echo "$apt_sources" | while read -r file; do 
+                    local fname=$(basename "$file")
+                    local enabled=$(safe_cmd 5 grep -v "^#" "$file" 2>/dev/null | grep -v "^$" | wc -l || echo "0")
+                    echo "  • $fname | enabled_entries: $enabled"
+                done
+                ((repos_found += apt_repo_count))
+            fi
+            
+            if [[ -n "$main_source" ]]; then
+                echo "  main_sources_list: [CONFIGURED]"
+            fi
+        fi
+        
+        # Проверка на отключенные репозитории
+        local disabled_repos=$(safe_cmd 10 apt-cache policy 2>/dev/null | grep -E "^\s+500|^\s+100" | wc -l || echo "0")
+        echo "  active_apt_repos: $disabled_repos"
+    else
+        echo "  apt_manager: [NOT_APPLICABLE]"
+    fi
+    
+    # === DNF/YUM РЕПОЗИТОРИИ (для RHEL/Fedora) ===
+    echo ""
+    echo "### DNF_YUM_REPOSITORIES"
+    echo "• DATA:"
+    
+    if [[ "$PKG_MGR" == "dnf" ]] || [[ "$PKG_MGR" == "yum" ]]; then
+        if [[ -d /etc/yum.repos.d ]]; then
+            local yum_repos=$(safe_cmd 10 find /etc/yum.repos.d -name "*.repo" -type f 2>/dev/null | head -20 || echo "")
+            
+            if [[ -n "$yum_repos" ]]; then
+                local yum_count=$(echo "$yum_repos" | wc -l)
+                echo "  yum_repo_files: $yum_count"
+                echo "• RAW_LOGS: [FILES]"
+                echo "$yum_repos" | while read -r file; do 
+                    local fname=$(basename "$file")
+                    local enabled=$(safe_cmd 5 grep -i "^enabled=1" "$file" 2>/dev/null | wc -l || echo "0")
+                    echo "  • $fname | enabled: $enabled"
+                done
+                ((repos_found += yum_count))
+            fi
+        fi
+        
+        # Список активных репозиториев
+        local active_repos=$(safe_cmd 20 dnf repolist enabled 2>/dev/null | tail -n +2 | wc -l || echo "0")
+        echo "  active_dnf_repos: $active_repos"
+    else
+        echo "  dnf_yum_manager: [NOT_APPLICABLE]"
+    fi
+    
+    # === PACMAN РЕПОЗИТОРИИ (для Arch) ===
+    echo ""
+    echo "### PACMAN_REPOSITORIES"
+    echo "• DATA:"
+    
+    if [[ "$PKG_MGR" == "pacman" ]]; then
+        if [[ -f /etc/pacman.conf ]]; then
+            local pacman_repos=$(safe_cmd 5 grep -E "^\[" /etc/pacman.conf 2>/dev/null | tr -d '[]' | head -20 || echo "")
+            
+            if [[ -n "$pacman_repos" ]]; then
+                local pac_count=$(echo "$pacman_repos" | wc -l)
+                echo "  pacman_repos_configured: $pac_count"
+                echo "• RAW_LOGS:"
+                echo "$pacman_repos" | while read -r repo; do echo "  • $repo"; done
+                ((repos_found += pac_count))
+            fi
+        fi
+    else
+        echo "  pacman_manager: [NOT_APPLICABLE]"
+    fi
+    
+    # === ZYPPER РЕПОЗИТОРИИ (для openSUSE) ===
+    echo ""
+    echo "### ZYPPER_REPOSITORIES"
+    echo "• DATA:"
+    
+    if [[ "$PKG_MGR" == "zypper" ]]; then
+        if check_tool zypper; then
+            local zypper_repos=$(safe_cmd 20 zypper repos -u 2>/dev/null | tail -n +4 | head -20 || echo "")
+            
+            if [[ -n "$zypper_repos" ]]; then
+                local zyp_count=$(echo "$zypper_repos" | wc -l)
+                echo "  zypper_repos_found: $zyp_count"
+                echo "• RAW_LOGS: [TRUNCATED: first 20]"
+                echo "$zypper_repos" | while read -r line; do echo "  • $line"; done
+                ((repos_found += zyp_count))
+            fi
+        fi
+    else
+        echo "  zypper_manager: [NOT_APPLICABLE]"
+    fi
+    
+    # === ИТОГОВАЯ СТАТИСТИКА ===
+    echo ""
+    echo "### REPOSITORY_SUMMARY"
+    echo "• DATA:"
+    echo "  total_repos_found: $repos_found"
+    echo "  additional_repos_available: $repos_available"
+    
+    if [[ $repos_available -gt 0 ]]; then
+        echo "  status: [CAN_CONNECT_MORE]"
+        add_issue "INFO" "Можно подключить дополнительные репозитории" "repositories" "Рассмотреть установку: docker, snap, flatpak"
+    else
+        echo "  status: [ALL_COMMON_REPOS_CHECKED]"
+    fi
+    
+    # Рекомендации по подключению
+    echo ""
+    echo "### AVAILABLE_TO_CONNECT"
+    echo "• DATA:"
+    echo "  format: tool | install_command | description"
+    echo "• RAW_LOGS:"
+    
+    if ! check_tool docker; then
+        echo "  • docker | curl -fsSL https://get.docker.com |sh | Контейнеризация приложений"
+    fi
+    if ! check_tool snap; then
+        case "$PKG_MGR" in
+            apt) echo "  • snap | sudo apt install snapd | Универсальные пакеты от Canonical" ;;
+            dnf|yum) echo "  • snap | sudo dnf install snapd | Универсальные пакеты от Canonical" ;;
+            pacman) echo "  • snap | sudo pacman -S snapd | Универсальные пакеты от Canonical" ;;
+            zypper) echo "  • snap | sudo zypper install snapd | Универсальные пакеты от Canonical" ;;
+        esac
+    fi
+    if ! check_tool flatpak; then
+        case "$PKG_MGR" in
+            apt) echo "  • flatpak | sudo apt install flatpak | Универсальные пакеты от сообщества" ;;
+            dnf|yum) echo "  • flatpak | sudo dnf install flatpak | Универсальные пакеты от сообщества" ;;
+            pacman) echo "  • flatpak | sudo pacman -S flatpak | Универсальные пакеты от сообщества" ;;
+            zypper) echo "  • flatpak | sudo zypper install flatpak | Универсальные пакеты от сообщества" ;;
+        esac
+    fi
 }
 
 #-------------------------------------------------------------------------------
@@ -2168,7 +2485,7 @@ show_menu() {
     echo "Выберите уровень сканирования:"
     echo ""
     echo "  [1] 🟢 МИНИМАЛЬНЫЙ: ядро, CPU/RAM базово, uptime, свободное место"
-    echo "  [2] 🟡 СРЕДНИЙ: всё из [1] + systemd, пакеты, сеть, SMART, пользователи"
+    echo "  [2] 🟡 СРЕДНИЙ: всё из [1] + systemd, пакеты, сеть, SMART, пользователи, репозитории"
     echo "  [3] 🔴 ТОТАЛЬНЫЙ: всё из [2] + безопасность, валидация, контейнеры"
     echo "  [4] ПРОФИЛИРОВАНИЕ: всё из [3] + perf eBPF метрики требуется подтверждение"
     echo ""
@@ -2246,7 +2563,7 @@ run_scan() {
     echo ""
     
     local step=0
-    local total_steps=21
+    local total_steps=22
     
     # Helper для вывода прогресса
     print_progress() {
@@ -2306,6 +2623,10 @@ run_scan() {
         print_progress "Управление пакетами" "RUNNING"
         scan_package_management
         print_progress "Управление пакетами" "OK"
+        
+        print_progress "Подключенные репозитории" "RUNNING"
+        scan_connected_repositories
+        print_progress "Подключенные репозитории" "OK"
         
         print_progress "Все установленные пакеты" "RUNNING"
         scan_all_installed_packages
