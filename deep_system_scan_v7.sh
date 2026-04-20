@@ -457,7 +457,10 @@ scan_memory_detailed() {
         local swap_free=$(safe_cmd 5 grep "^SwapFree:" /proc/meminfo | awk '{print $2}' || echo "0")
         
         local mem_used=$((mem_total - mem_free - mem_buffers - mem_cached))
-        local mem_percent=$((mem_used * 100 / mem_total))
+        local mem_percent=0
+        if (( mem_total > 0 )); then
+            mem_percent=$((mem_used * 100 / mem_total))
+        fi
         local swap_used=$((swap_total - swap_free))
         
         echo "  total_kb: $mem_total"
@@ -571,7 +574,6 @@ scan_storage_detailed() {
             fi
             
             local poh=$(sanitize_num "$(safe_cmd 30 smartctl -A "$disk" 2>/dev/null | grep -i "Power_On_Hours" | awk '{ print $NF }' || echo "0")")
-            local poh=$(safe_cmd 30 smartctl -A "$disk" 2>/dev/null | grep -i "Power_On_Hours" | awk '{print $NF}' || echo "0")
             echo "  power_on_hours: $poh"
         done
     else
@@ -644,7 +646,7 @@ scan_battery_power() {
                 local bat_name=$(basename "$bat")
                 echo "  battery: $bat_name"
                 
-                local capacity=$(safe_cmd 5 cat "$bat/capacity" 2>/dev/null || echo "[UNAVAILABLE]")
+                local capacity=$(sanitize_num "$(safe_cmd 5 cat "$bat/capacity" 2>/dev/null || echo "[UNAVAILABLE]")")
                 local status=$(safe_cmd 5 cat "$bat/status" 2>/dev/null || echo "[UNAVAILABLE]")
                 local energy_full=$(safe_cmd 5 cat "$bat/energy_full" 2>/dev/null || safe_cmd 5 cat "$bat/charge_full" 2>/dev/null || echo "[UNAVAILABLE]")
                 local energy_now=$(safe_cmd 5 cat "$bat/energy_now" 2>/dev/null || safe_cmd 5 cat "$bat/charge_now" 2>/dev/null || echo "[UNAVAILABLE]")
@@ -654,7 +656,7 @@ scan_battery_power() {
                 echo "    energy_full: $energy_full"
                 echo "    energy_now: $energy_now"
                 
-                if [[ $capacity -lt 50 ]]; then
+                if [[ $(sanitize_num "$capacity") -lt 50 ]]; then
                     add_issue "WARNING" "Износ батареи > 50%" "$bat_name" "Рассмотреть замену батареи"
                 fi
             done
@@ -1015,7 +1017,8 @@ scan_config_validation() {
     
     local failed_units=$(safe_cmd 10 systemctl --failed --no-pager 2>/dev/null | tail -n +2 || echo "")
     if [[ -n "$failed_units" ]]; then
-        local failed_count=$(echo "$failed_units" | wc -l)
+        local failed_count=0
+        [[ -n "$failed_units" ]] && failed_count=$(echo "$failed_units" | wc -l)
         echo "  failed_units_count: $failed_count"
         echo "• RAW_LOGS:"
         echo "$failed_units" | while read -r line; do echo "  $line"; done
@@ -1884,8 +1887,8 @@ scan_security_hardening() {
     echo "• DATA:"
     
     if [[ -f /etc/ssh/sshd_config ]]; then
-        local root_login=$(safe_cmd 5 grep -i "^PermitRootLogin" /etc/ssh/sshd_config 2>/dev/null | awk '{print $2}' || "not_set")
-        local pass_auth=$(safe_cmd 5 grep -i "^PasswordAuthentication" /etc/ssh/sshd_config 2>/dev/null | awk '{print $2}' || "not_set")
+        local root_login=$(safe_cmd 5 grep -i "^PermitRootLogin" /etc/ssh/sshd_config 2>/dev/null | awk '{print $2}' || echo "not_set")
+        local pass_auth=$(safe_cmd 5 grep -i "^PasswordAuthentication" /etc/ssh/sshd_config 2>/dev/null | awk '{print $2}' || echo "not_set")
         
         echo "  permit_root_login: $root_login"
         echo "  password_authentication: $pass_auth"
@@ -1982,7 +1985,7 @@ scan_hardware_driver_audit() {
     if check_tool lspci; then
         local pci_output=$(safe_cmd 15 lspci -nnk 2>/dev/null || echo "")
         local driver_in_use=""
-        echo "$pci_output" | while read -r line; do
+        while read -r line; do
             if [[ "$line" =~ ^[0-9a-f] ]]; then
                 # Это строка устройства
                 local pci_slot=$(echo "$line" | cut -d' ' -f1)
@@ -2007,7 +2010,7 @@ scan_hardware_driver_audit() {
                     echo "    WARNING: Нет активного драйвера!"
                 fi
             fi
-        done
+        done < <(echo "$pci_output")
         
         # Поиск устройств без драйверов
         echo ""
@@ -2045,7 +2048,7 @@ scan_hardware_driver_audit() {
         echo ""
         echo "### USB_DRIVER_STATUS"
         local lsusb_output=$(safe_cmd 10 lsusb -t 2>/dev/null || echo "")
-        echo "$lsusb_output" | while read -r line; do
+        while read -r line; do
             if [[ "$line" =~ Hub|Hub ]]; then
                 continue
             fi
@@ -2057,7 +2060,7 @@ scan_hardware_driver_audit() {
                     echo "  USB_OK: $(echo "$line" | grep -oP '.*?(?=:)' || echo "device") | driver=$driver"
                 fi
             fi
-        done
+        done < <(echo "$lsusb_output")
         
         # Проверка на устройства в режиме высокой скорости без драйверов
         local usb_errors=$(safe_cmd 10 dmesg 2>/dev/null | grep -iE "usb.*not recognized|usb.*descriptor failed" | tail -5 || echo "")
@@ -2089,11 +2092,11 @@ scan_hardware_driver_audit() {
             done
             
             # Проверка драйверов для контроллеров
-            safe_cmd 15 lspci -k 2>/dev/null | grep -A2 -iE "sata|nvme|storage" | while read -r line; do
+            while read -r line; do
                 if [[ "$line" =~ "Kernel driver in use:" ]]; then
                     echo "    STORAGE_DRIVER: $(echo "$line" | cut -d':' -f2 | xargs)"
                 fi
-            done
+            done < <(safe_cmd 15 lspci -k 2>/dev/null | grep -A2 -iE "sata|nvme|storage")
         else
             echo "  standard_sata_nvme_controllers: detected"
         fi
@@ -2266,6 +2269,9 @@ scan_hardware_driver_audit() {
 scan_malware_viruses() {
     local level_required=$LEVEL_TOTAL
     [[ $SCAN_LEVEL -lt $level_required ]] && return 0
+    
+    # Инициализация переменных для безопасности при set -u
+    local chkroot_result="" rkh_result="" clam_result=""
     
     echo ""
     echo "## [MALWARE_VIRUS_SCAN]"
