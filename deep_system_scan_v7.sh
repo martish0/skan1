@@ -184,7 +184,7 @@ check_and_install_tools() {
         
         if ! check_tool "$tool"; then
             missing_tools+=("$pkg_name")
-            echo -e "${COLOR_YELLOW}[MISSING]${COLOR_RESET} $tool (пакет: $pkg_name)"
+            echo -e "${COLOR_YELLOW}[MISSING]${COLOR_RESET} $tool пакет: $pkg_name"
         fi
     done
     
@@ -1593,6 +1593,151 @@ scan_performance_metrics() {
     fi
 }
 
+scan_malware_viruses() {
+    local level_required=$LEVEL_TOTAL
+    [[ $SCAN_LEVEL -lt $level_required ]] && return 0
+    
+    echo ""
+    echo "## [MALWARE_VIRUS_SCAN]"
+    echo "### ROOTKIT_CHECK"
+    
+    echo "• STATUS: OK"
+    echo "• DATA:"
+    
+    # chkrootkit
+    if check_tool chkrootkit; then
+        echo "  chkrootkit: installed"
+        local chkroot_result=$(safe_cmd 60 chkrootkit 2>/dev/null | grep -i "infected\\|not found\" || echo "clean")
+        if [[ "$chkroot_result" != "clean" ]]; then
+            echo "  chkrootkit_status: SUSPECTED"
+            add_issue "CRITICAL" "Возможное заражение rootkit" "security" "Запустить глубокую проверку, изолировать систему"
+            echo "• RAW_LOGS:"
+            echo "$chkroot_result" | head -10 | while read -r line; do echo "  $line"; done
+        else
+            echo "  chkrootkit_status: clean"
+        fi
+    else
+        echo "  chkrootkit: [TOOL_MISSING]"
+    fi
+    
+    # rkhunter
+    echo ""
+    echo "### RKHUNTER_CHECK"
+    echo "• DATA:"
+    
+    if check_tool rkhunter; then
+        echo "  rkhunter: installed"
+        local rkh_result=$(safe_cmd 60 rkhunter --check --skip-keypress 2>/dev/null | grep -iE "warning|infected|suspect" | head -10 || echo "clean")
+        if [[ -n "$rkh_result" && "$rkh_result" != "clean" ]]; then
+            echo "  rkhunter_status: SUSPECTED"
+            add_issue "CRITICAL" "Возможное заражение по данным rkhunter" "security" "Проверить логи /var/log/rkhunter.log"
+            echo "• RAW_LOGS:"
+            echo "$rkh_result" | while read -r line; do echo "  $line"; done
+        else
+            echo "  rkhunter_status: clean"
+        fi
+    else
+        echo "  rkhunter: [TOOL_MISSING]"
+    fi
+    
+    # ClamAV
+    echo ""
+    echo "### CLAMAV_SCAN"
+    echo "• DATA:"
+    
+    if check_tool clamscan; then
+        echo "  clamav: installed"
+        local clam_db=$(safe_cmd 10 freshclam --version 2>/dev/null | head -1 || echo "db_unknown")
+        echo "  database: $clam_db"
+        
+        # Быстрая проверка критических директорий
+        echo "  scanning: /etc /usr/bin /usr/sbin /tmp быстрая_проверка"
+        local clam_result=$(safe_cmd 300 clamscan --no-summary --infected -r /etc /usr/bin /usr/sbin /tmp 2>/dev/null | head -50 || echo "")
+        if [[ -n "$clam_result" ]]; then
+            echo "  clamav_status: THREATS_FOUND"
+            add_issue "CRITICAL" "Найдены угрозы по данным ClamAV" "security" "Изолировать файлы, проверить карантин"
+            echo "• RAW_LOGS: [TRUNCATED: first 50]"
+            echo "$clam_result" | while read -r line; do echo "  $line"; done
+        else
+            echo "  clamav_status: clean"
+        fi
+    else
+        echo "  clamav: [TOOL_MISSING]"
+    fi
+    
+    # Подозрительные процессы
+    echo ""
+    echo "### SUSPICIOUS_PROCESSES"
+    echo "• DATA:"
+    
+    local suspicious_count=0
+    
+    # Процессы с высоким CPU в фоне
+    local hidden_procs=$(safe_cmd 10 ps aux 2>/dev/null | awk '$8 ~ /^[RD]/ && $3 > 80 {print}' | head -10 || echo "")
+    if [[ -n "$hidden_procs" ]]; then
+        echo "  high_cpu_hidden: detected"
+        echo "$hidden_procs" | while read -r line; do echo "  $line"; done
+        ((suspicious_count++))
+    else
+        echo "  high_cpu_hidden: none"
+    fi
+    
+    # Процессы из /tmp или странных путей
+    local tmp_procs=$(safe_cmd 10 ps aux 2>/dev/null | grep -E "/tmp/|/dev/shm/|\\.\\." | grep -v grep | head -10 || echo "")
+    if [[ -n "$tmp_procs" ]]; then
+        echo "  tmp_path_processes: detected"
+        add_issue "WARNING" "Процессы запущены из временных директорий" "security" "Проверить легитимность процессов"
+        echo "$tmp_procs" | while read -r line; do echo "  $line"; done
+        ((suspicious_count++))
+    else
+        echo "  tmp_path_processes: none"
+    fi
+    
+    # Сетевые соединения на странные порты
+    echo ""
+    echo "### SUSPICIOUS_NETWORK"
+    echo "• DATA:"
+    
+    if check_tool ss; then
+        local weird_ports=$(safe_cmd 10 ss -tulpn 2>/dev/null | grep -E ":[0-9]{5}|LISTEN.*0\\.0\\.0\\.0.*:(22|80|443)\" | grep -v \":22 \" | head -20 || echo "")
+        if [[ -n "$weird_ports" ]]; then
+            echo "  unusual_listeners: detected"
+            echo "$weird_ports" | while read -r line; do echo "  $line"; done
+        else
+            echo "  unusual_listeners: none"
+        fi
+    fi
+    
+    # Проверка cron на подозрительные задачи
+    echo ""
+    echo "### CRON_MALWARE_CHECK"
+    echo "• DATA:"
+    
+    local cron_suspicious=$(safe_cmd 10 grep -rE "curl.*\\|.*bash|wget.*\\|.*sh|nc -e|/dev/tcp" /etc/cron* /var/spool/cron 2>/dev/null | head -10 || echo "")
+    if [[ -n "$cron_suspicious" ]]; then
+        echo "  suspicious_cron: detected"
+        add_issue "CRITICAL" "Подозрительные задачи в cron возможно майнеры ботнеты" "security" "Удалить вредоносные задачи проверить пользователя"
+        echo "• RAW_LOGS:"
+        echo "$cron_suspicious" | while read -r line; do echo "  $line"; done
+    else
+        echo "  suspicious_cron: none"
+    fi
+    
+    # Итоговый статус
+    echo ""
+    echo "### SCAN_SUMMARY"
+    echo "• DATA:"
+    echo "  tools_available: chkrootkit[$(check_tool chkrootkit && echo yes || echo no)] rkhunter[$(check_tool rkhunter && echo yes || echo no)] clamav[$(check_tool clamscan && echo yes || echo no)]"
+    echo "  suspicious_processes: $suspicious_count"
+    
+    if [[ $suspicious_count -eq 0 ]] && ! grep -q "THREATS_FOUND\\|SUSPECTED" <<< "$(echo "$chkroot_result$rkh_result$clam_result" 2>/dev/null)"; then
+        echo "  overall_status: CLEAN"
+    else
+        echo "  overall_status: REQUIRES_INVESTIGATION"
+        add_issue "CRITICAL" "Обнаружены признаки возможного заражения" "system" "Требуется глубокий анализ безопасности"
+    fi
+}
+
 scan_strict_prohibitions() {
     echo ""
     echo "## [STRICT_PROHIBITIONS]"
@@ -1600,7 +1745,7 @@ scan_strict_prohibitions() {
     # Универсальные запреты
     add_prohibition "Менять права на /etc, /usr, /lib рекурсивно" "Риск поломки системы" "Использовать точечные изменения с бэкапом"
     add_prohibition "Отключать systemd-resolved/NetworkManager/sshd без fallback" "Потеря доступа к системе" "Сначала настроить альтернативный метод доступа"
-    add_prohibition "Удалять dkms-модули или /lib/modules/\$(uname -r) без проверки" "Система не загрузится" "Использовать autoremove и проверить зависимости"
+    add_prohibition "Удалять dkms-модули или ядро без проверки" "Система не загрузится" "Использовать autoremove и проверить зависимости"
     add_prohibition "Запускать fsck на смонтированном корне" "Потеря данных" "Загрузиться с LiveUSB, сделать backup"
     add_prohibition "Игнорировать пометки [CRITICAL], [NEEDS_ROOT] из отчёта" "Риск усугубления проблем" "Сначала проанализировать, потом действовать"
     add_prohibition "Применять быстрые фиксы из интернета без понимания" "Непредсказуемые последствия" "Проверить в тестовой среде, иметь план отката"
@@ -1710,7 +1855,7 @@ show_menu() {
     echo "  [1] 🟢 МИНИМАЛЬНЫЙ: ядро, CPU/RAM базово, uptime, свободное место"
     echo "  [2] 🟡 СРЕДНИЙ: всё из [1] + systemd, пакеты, сеть, SMART, пользователи"
     echo "  [3] 🔴 ТОТАЛЬНЫЙ: всё из [2] + безопасность, валидация, контейнеры"
-    echo "  [4] ⚡ ПРОФИЛИРОВАНИЕ: всё из [3] + perf/eBPF метрики (требуется подтверждение)"
+    echo "  [4] ПРОФИЛИРОВАНИЕ: всё из [3] + perf eBPF метрики требуется подтверждение"
     echo ""
     echo -n "Ваш выбор [1-4]: "
 }
@@ -1735,7 +1880,7 @@ get_scan_level() {
                 echo "Использование: $0 [OPTIONS]"
                 echo ""
                 echo "OPTIONS:"
-                echo "  --level=N          Уровень сканирования (1-4)"
+                echo "  --level=N          Уровень сканирования 1-4"
                 echo "  --auto-install     Автоматически установить недостающие утилиты"
                 echo "  --force-profiling  Режим профилирования без подтверждения"
                 echo "  --help, -h         Показать эту справку"
@@ -1768,7 +1913,7 @@ get_scan_level() {
                 fi
                 ;;
             *)
-                echo -e "${COLOR_RED}❌ Неверный выбор. По умолчанию установлен уровень 2 (Средний).${COLOR_RESET}"
+                echo -e "${COLOR_RED}Неверный выбор. По умолчанию установлен уровень 2.${COLOR_RESET}"
                 SCAN_LEVEL=$LEVEL_MEDIUM
                 ;;
         esac
@@ -1781,7 +1926,7 @@ get_scan_level() {
 run_scan() {
     echo ""
     echo "═══════════════════════════════════════════════════════════"
-    echo "  🚀 Начало сканирования (уровень: $SCAN_LEVEL)"
+    echo "  Начало сканирования уровень: $SCAN_LEVEL"
     echo "═══════════════════════════════════════════════════════════"
     echo ""
     
@@ -1877,6 +2022,10 @@ run_scan() {
         print_progress "Безопасность и hardening" "RUNNING"
         scan_security_hardening
         print_progress "Безопасность и hardening" "OK"
+        
+        print_progress "Проверка на вирусы и малварь" "RUNNING"
+        scan_malware_viruses
+        print_progress "Проверка на вирусы и малварь" "OK"
     fi
     
     # === PROFILING LEVEL ===
