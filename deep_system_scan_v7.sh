@@ -2367,6 +2367,26 @@ main() {
     # Обработка аргументов и получение уровня
     get_scan_level "$@"
     
+    # === ЗАПРОС SUDO ПРАВ В НАЧАЛЕ ===
+    echo ""
+    echo -e "${COLOR_BLUE}🔐 Проверка прав суперпользователя...${COLOR_RESET}"
+    if sudo -n true 2>/dev/null; then
+        echo -e "${COLOR_GREEN}✅ Права sudo уже доступны (без пароля)${COLOR_RESET}"
+    else
+        echo "Для полного сканирования требуются права root."
+        echo "Пожалуйста, введите пароль sudo для получения прав на всю сессию:"
+        if sudo -v 2>/dev/null; then
+            echo -e "${COLOR_GREEN}✅ Права sudo успешно получены${COLOR_RESET}"
+            # Обновляем таймаут sudo в фоне
+            (while true; do sudo -n true 2>/dev/null && sleep 60 || break; done) &
+            SUDO_KEEPALIVE_PID=$!
+            trap 'kill $SUDO_KEEPALIVE_PID 2>/dev/null; exit 130' INT TERM
+        else
+            echo -e "${COLOR_YELLOW}⚠️ Не удалось получить права sudo. Некоторые проверки будут пропущены.${COLOR_RESET}"
+        fi
+    fi
+    echo ""
+    
     # Проверка и установка утилит
     check_and_install_tools
     
@@ -2379,6 +2399,11 @@ main() {
     
     # Запуск сканирования с перенаправлением вывода в файл
     run_scan 2>&1 | tee "$OUTPUT_FILE"
+    
+    # Останавливаем фоновый процесс обновления sudo
+    if [[ -n "$SUDO_KEEPALIVE_PID" ]]; then
+        kill $SUDO_KEEPALIVE_PID 2>/dev/null
+    fi
     
     # Финальная проверка
     echo ""
