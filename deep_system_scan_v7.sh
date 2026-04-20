@@ -1593,6 +1593,310 @@ scan_performance_metrics() {
     fi
 }
 
+#-------------------------------------------------------------------------------
+# scan_hardware_driver_audit - Аудит железа и драйверов, поиск несоответствий
+# Уровень: 3 (Тотальный)
+#-------------------------------------------------------------------------------
+scan_hardware_driver_audit() {
+    local level_required=$LEVEL_TOTAL
+    [[ $SCAN_LEVEL -lt $level_required ]] && return 0
+    
+    echo ""
+    echo "## [HARDWARE_DRIVER_AUDIT]"
+    echo "### HARDWARE_INVENTORY"
+    echo "• STATUS: OK"
+    echo "• DATA:"
+    echo "  scanning: PCI USB SATA NVMe I2C SDIO devices"
+    
+    local mismatches_found=0
+    local missing_drivers=0
+    
+    # === PCI УСТРОЙСТВА ===
+    echo ""
+    echo "### PCI_DEVICES_CHECK"
+    echo "• DATA:"
+    
+    if check_tool lspci; then
+        safe_cmd 15 lspci -nnk 2>/dev/null | while read -r line; do
+            if [[ "$line" =~ ^[0-9a-f] ]]; then
+                # Это строка устройства
+                local pci_slot=$(echo "$line" | cut -d' ' -f1)
+                local device_desc=$(echo "$line" | cut -d':' -f2-)
+                echo "  PCI_DEVICE: $pci_slot |$device_desc"
+            elif [[ "$line" =~ "Kernel driver in use:" ]]; then
+                local driver=$(echo "$line" | cut -d':' -f2 | xargs)
+                echo "    DRIVER_IN_USE: $driver"
+                
+                # Проверка на универсальные драйверы вместо специфичных
+                if [[ "$driver" == "pcieport" ]]; then
+                    echo "    NOTE: Универсальный драйвер pcieport (нормально для мостов)"
+                fi
+            elif [[ "$line" =~ "Kernel modules:" ]]; then
+                local modules=$(echo "$line" | cut -d':' -f2 | xargs)
+                echo "    AVAILABLE_MODULES: $modules"
+                
+                # Если нет драйвера в использовании
+                if [[ -z "$driver_in_use" ]]; then
+                    echo "    WARNING: Нет активного драйвера!"
+                    ((missing_drivers++))
+                fi
+            fi
+        done
+        
+        # Поиск устройств без драйверов
+        echo ""
+        echo "### PCI_NO_DRIVER"
+        local no_driver=$(safe_cmd 15 lspci -k 2>/dev/null | grep -B1 "Kernel driver in use:" | grep -v "Kernel driver" | grep -v "^--$" || echo "")
+        if [[ -z "$no_driver" ]]; then
+            # Альтернативная проверка - устройства без "Kernel driver in use"
+            local all_devices=$(safe_cmd 15 lspci 2>/dev/null | wc -l)
+            local devices_with_driver=$(safe_cmd 15 lspci -k 2>/dev/null | grep -c "Kernel driver in use:" || echo "0")
+            local devices_without=$((all_devices - devices_with_driver))
+            
+            echo "  total_pci_devices: $all_devices"
+            echo "  with_driver: $devices_with_driver"
+            echo "  without_explicit_driver: $devices_without (может быть нормально для мостов)"
+            
+            if [[ $devices_without -gt $((all_devices / 2)) ]]; then
+                add_issue "WARNING" "Множество PCI устройств без явного драйвера" "hardware" "Проверить lspci -v для деталей"
+                ((mismatches_found++))
+            fi
+        fi
+    else
+        echo "  [TOOL_MISSING: lspci]"
+    fi
+    
+    # === USB УСТРОЙСТВА ===
+    echo ""
+    echo "### USB_DEVICES_CHECK"
+    echo "• DATA:"
+    
+    if check_tool lsusb; then
+        local usb_count=$(safe_cmd 10 lsusb 2>/dev/null | wc -l)
+        echo "  total_usb_devices: $usb_count"
+        
+        # Поиск USB устройств без драйверов
+        echo ""
+        echo "### USB_DRIVER_STATUS"
+        safe_cmd 10 lsusb -t 2>/dev/null | while read -r line; do
+            if [[ "$line" =~ Hub|Hub ]]; then
+                continue
+            fi
+            if [[ "$line" =~ Driver= ]]; then
+                local driver=$(echo "$line" | grep -oP 'Driver=\K[^ ]*' || echo "none")
+                if [[ "$driver" == "(none)" || -z "$driver" ]]; then
+                    echo "  MISSING_USB_DRIVER: $line"
+                    ((missing_drivers++))
+                else
+                    echo "  USB_OK: $(echo "$line" | grep -oP '.*?(?=:)' || echo "device") | driver=$driver"
+                fi
+            fi
+        done
+        
+        # Проверка на устройства в режиме высокой скорости без драйверов
+        local usb_errors=$(safe_cmd 10 dmesg 2>/dev/null | grep -iE "usb.*not recognized|usb.*descriptor failed" | tail -5 || echo "")
+        if [[ -n "$usb_errors" ]]; then
+            echo ""
+            echo "### USB_ERRORS_DMESG"
+            echo "• STATUS: WARNING"
+            echo "• RAW_LOGS:"
+            echo "$usb_errors" | while read -r line; do echo "  $line"; done
+            add_issue "WARNING" "Ошибки распознавания USB устройств" "hardware" "Проверить питание и кабели"
+            ((mismatches_found++))
+        fi
+    else
+        echo "  [TOOL_MISSING: lsusb]"
+    fi
+    
+    # === SATA/NVMe УСТРОЙСТВА ===
+    echo ""
+    echo "### STORAGE_CONTROLLER_CHECK"
+    echo "• DATA:"
+    
+    # Контроллеры хранилищ
+    if check_tool lspci; then
+        local storage_controllers=$(safe_cmd 15 lspci -nn 2>/dev/null | grep -iE "sata|nvme|storage|mass storage" || echo "")
+        if [[ -n "$storage_controllers" ]]; then
+            echo "  storage_controllers_found:"
+            echo "$storage_controllers" | while read -r line; do
+                echo "    $line"
+            done
+            
+            # Проверка драйверов для контроллеров
+            safe_cmd 15 lspci -k 2>/dev/null | grep -A2 -iE "sata|nvme|storage" | while read -r line; do
+                if [[ "$line" =~ "Kernel driver in use:" ]]; then
+                    echo "    STORAGE_DRIVER: $(echo "$line" | cut -d':' -f2 | xargs)"
+                fi
+            done
+        else
+            echo "  standard_sata_nvme_controllers: detected"
+        fi
+    fi
+    
+    # NVMe health
+    if check_tool nvme; then
+        echo ""
+        echo "### NVME_HEALTH_CHECK"
+        local nvme_list=$(safe_cmd 10 nvme list 2>/dev/null || echo "")
+        if [[ -n "$nvme_list" ]]; then
+            echo "• DATA:"
+            echo "$nvme_list" | tail -n +2 | while read -r line; do
+                local nvme_dev=$(echo "$line" | awk '{print $1}')
+                local nvme_model=$(echo "$line" | awk '{$1=""; print}' | xargs)
+                echo "  NVME_DEVICE: $nvme_dev | $nvme_model"
+                
+                # Health check если есть доступ
+                if [[ -e "/dev/${nvme_dev}" ]]; then
+                    local health=$(safe_sudo_cmd 10 nvme smart-log "/dev/${nvme_dev}" 2>/dev/null | grep -E "critical_warning|temperature|available_spare" || echo "")
+                    if [[ -n "$health" ]]; then
+                        echo "    HEALTH: critical_warning=$(echo "$health" | grep critical_warning | awk '{print $2}')"
+                    fi
+                fi
+            done
+        else
+            echo "  nvme_cli: installed_but_no_devices"
+        fi
+    else
+        echo "  nvme_cli: [TOOL_MISSING]"
+    fi
+    
+    # === ПРОВЕРКА НЕСООТВЕТСТВИЙ ===
+    echo ""
+    echo "### DRIVER_MISMATCH_DETECTION"
+    echo "• STATUS: OK"
+    echo "• DATA:"
+    
+    # 1.GPU драйвер vs GPU hardware
+    echo "  Checking GPU driver matching..."
+    local gpu_vendor=""
+    if check_tool lspci; then
+        if safe_cmd 10 lspci -nn 2>/dev/null | grep -i "vga.*nvidia\|3d.*nvidia" >/dev/null; then
+            gpu_vendor="nvidia"
+            if ! lsmod 2>/dev/null | grep -qE "nvidia|nouveau"; then
+                echo "  MISMATCH: NVIDIA GPU detected but no nvidia/nouveau driver loaded"
+                add_issue "CRITICAL" "NVIDIA GPU без загруженного драйвера" "hardware" "Установить драйвер nvidia или nouveau"
+                ((mismatches_found++))
+            else
+                local loaded_gpu=$(lsmod 2>/dev/null | grep -oE "nvidia[^ ]*|nouveau" | head -1)
+                echo "  GPU_MATCH: NVIDIA | driver=$loaded_gpu"
+            fi
+        elif safe_cmd 10 lspci -nn 2>/dev/null | grep -i "vga.*amd\|vga.*ati\|display.*amd" >/dev/null; then
+            gpu_vendor="amd"
+            if ! lsmod 2>/dev/null | grep -qE "amdgpu|radeon"; then
+                echo "  MISMATCH: AMD GPU detected but no amdgpu/radeon driver loaded"
+                add_issue "CRITICAL" "AMD GPU без загруженного драйвера" "hardware" "Установить драйвер amdgpu или radeon"
+                ((mismatches_found++))
+            else
+                local loaded_gpu=$(lsmod 2>/dev/null | grep -oE "amdgpu|radeon" | head -1)
+                echo "  GPU_MATCH: AMD | driver=$loaded_gpu"
+            fi
+        elif safe_cmd 10 lspci -nn 2>/dev/null | grep -i "vga.*intel\|display.*intel" >/dev/null; then
+            gpu_vendor="intel"
+            if ! lsmod 2>/dev/null | grep -qE "i915|iris"; then
+                echo "  MISMATCH: Intel GPU detected but no i915/iris driver loaded"
+                add_issue "WARNING" "Intel GPU без загруженного драйвера i915" "hardware" "Проверить загрузку модуля i915"
+                ((mismatches_found++))
+            else
+                echo "  GPU_MATCH: Intel | driver=i915"
+            fi
+        else
+            echo "  GPU: discrete_gpu_not_detected (возможно integrated или VM)"
+        fi
+    fi
+    
+    # 2.WiFi драйвер vs WiFi hardware
+    echo ""
+    echo "  Checking WiFi driver matching..."
+    if check_tool lspci; then
+        local wifi_hw=$(safe_cmd 10 lspci -nn 2>/dev/null | grep -i "network.*wireless\|network.*802.11" || echo "")
+        if [[ -n "$wifi_hw" ]]; then
+            echo "  WIFI_HARDWARE: detected"
+            local wifi_driver=$(safe_cmd 10 lspci -k 2>/dev/null | grep -A2 -i network | grep "Kernel driver in use:" | cut -d':' -f2 | xargs || echo "")
+            if [[ -z "$wifi_driver" ]]; then
+                echo "  MISMATCH: WiFi hardware detected but no driver loaded"
+                add_issue "CRITICAL" "WiFi адаптер без драйвера" "hardware" "Установить драйвер для WiFi"
+                ((mismatches_found++))
+            else
+                echo "  WIFI_MATCH: driver=$wifi_driver"
+            fi
+        else
+            # Проверка USB WiFi
+            if check_tool lsusb; then
+                local usb_wifi=$(safe_cmd 10 lsusb 2>/dev/null | grep -i wireless || echo "")
+                if [[ -n "$usb_wifi" ]]; then
+                    echo "  USB_WIFI_HARDWARE: detected"
+                fi
+            fi
+        fi
+    fi
+    
+    # 3.Ethernet драйвер vs Ethernet hardware
+    echo ""
+    echo "  Checking Ethernet driver matching..."
+    if check_tool lspci; then
+        local eth_hw=$(safe_cmd 10 lspci -nn 2>/dev/null | grep -i "ethernet\|network.*controller" | grep -v wireless || echo "")
+        if [[ -n "$eth_hw" ]]; then
+            echo "  ETHERNET_HARDWARE: detected"
+            local eth_driver=$(safe_cmd 10 lspci -k 2>/dev/null | grep -A2 -i ethernet | grep "Kernel driver in use:" | cut -d':' -f2 | xargs || echo "")
+            if [[ -z "$eth_driver" ]]; then
+                echo "  MISMATCH: Ethernet hardware detected but no driver loaded"
+                add_issue "WARNING" "Ethernet адаптер без драйвера" "hardware" "Установить драйвер для Ethernet"
+                ((mismatches_found++))
+            else
+                echo "  ETHERNET_MATCH: driver=$eth_driver"
+            fi
+        fi
+    fi
+    
+    # 4.Audio драйвер vs Audio hardware
+    echo ""
+    echo "  Checking Audio driver matching..."
+    if check_tool lspci; then
+        local audio_hw=$(safe_cmd 10 lspci -nn 2>/dev/null | grep -i "audio\|multimedia" || echo "")
+        if [[ -n "$audio_hw" ]]; then
+            echo "  AUDIO_HARDWARE: detected"
+            local audio_driver=$(safe_cmd 10 lspci -k 2>/dev/null | grep -A2 -i audio | grep "Kernel driver in use:" | cut -d':' -f2 | xargs || echo "")
+            if [[ -z "$audio_driver" ]]; then
+                echo "  MISMATCH: Audio hardware detected but no driver loaded"
+                add_issue "WARNING" "Аудио устройство без драйвера" "hardware" "Проверить модуль snd_hda_intel или другой"
+                ((mismatches_found++))
+            else
+                echo "  AUDIO_MATCH: driver=$audio_driver"
+            fi
+        fi
+    fi
+    
+    # 5.Проверка отсутствующих прошивок
+    echo ""
+    echo "### FIRMWARE_MISSING_CHECK"
+    echo "• DATA:"
+    
+    local fw_missing=$(safe_cmd 10 dmesg 2>/dev/null | grep -iE "firmware: failed to load|direct firmware load for.*failed" | tail -10 || echo "")
+    if [[ -n "$fw_missing" ]]; then
+        echo "• STATUS: WARNING"
+        echo "• RAW_LOGS:"
+        echo "$fw_missing" | while read -r line; do echo "  $line"; done
+        add_issue "WARNING" "Отсутствуют прошивки для устройств" "hardware" "Установить пакет linux-firmware"
+        ((missing_drivers++))
+    else
+        echo "  firmware_load: all_ok"
+    fi
+    
+    # === ИТОГОВЫЙ СТАТУС ===
+    echo ""
+    echo "### AUDIT_SUMMARY"
+    echo "• DATA:"
+    echo "  total_mismatches: $mismatches_found"
+    echo "  missing_drivers_count: $missing_drivers"
+    
+    if [[ $mismatches_found -eq 0 && $missing_drivers -eq 0 ]]; then
+        echo "  overall_status: ALL_DRIVERS_MATCHED"
+    else
+        echo "  overall_status: MISMATCHES_DETECTED"
+        add_issue "WARNING" "Обнаружены несоответствия железа и драйверов" "hardware" "Проверить раздел HARDWARE_DRIVER_AUDIT"
+    fi
+}
+
 scan_malware_viruses() {
     local level_required=$LEVEL_TOTAL
     [[ $SCAN_LEVEL -lt $level_required ]] && return 0
@@ -2033,6 +2337,10 @@ run_scan() {
         print_progress "Безопасность и hardening" "RUNNING"
         scan_security_hardening
         print_progress "Безопасность и hardening" "OK"
+        
+        print_progress "Аудит железа и драйверов" "RUNNING"
+        scan_hardware_driver_audit
+        print_progress "Аудит железа и драйверов" "OK"
         
         print_progress "Проверка на вирусы и малварь" "RUNNING"
         scan_malware_viruses
