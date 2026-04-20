@@ -755,8 +755,10 @@ scan_network_detailed() {
         if [[ -f "/sys/class/net/$iface/statistics/rx_bytes" ]]; then
             local rx_bytes=$(safe_cmd 5 cat "/sys/class/net/$iface/statistics/rx_bytes" 2>/dev/null || echo "0")
             local tx_bytes=$(safe_cmd 5 cat "/sys/class/net/$iface/statistics/tx_bytes" 2>/dev/null || echo "0")
-            local rx_errors=$(safe_cmd 5 cat "/sys/class/net/$iface/statistics/rx_errors" 2>/dev/null || echo "0")
-            local tx_errors=$(safe_cmd 5 cat "/sys/class/net/$iface/statistics/tx_errors" 2>/dev/null || echo "0")
+            local rx_errors_raw=$(safe_cmd 5 cat "/sys/class/net/$iface/statistics/rx_errors" 2>/dev/null || echo "0")
+            local tx_errors_raw=$(safe_cmd 5 cat "/sys/class/net/$iface/statistics/tx_errors" 2>/dev/null || echo "0")
+            local rx_errors=$(sanitize_num "$rx_errors_raw")
+            local tx_errors=$(sanitize_num "$tx_errors_raw")
             
             echo "    rx_bytes: $rx_bytes"
             echo "    tx_bytes: $tx_bytes"
@@ -854,7 +856,8 @@ scan_hardware_errors() {
     echo "• STATUS: OK"
     echo "• DATA:"
     
-    local mce_count_raw=$(safe_cmd 10 dmesg 2>/dev/null | grep -c -i "MCE|Machine Check" || echo "0")
+    # MCE ошибки
+    local mce_count_raw=$(safe_cmd 10 dmesg 2>/dev/null | grep -c -iE "MCE|Machine Check" || echo "0")
     local mce_count=$(sanitize_num "$mce_count_raw")
     echo "  mce_events: $mce_count"
     
@@ -867,9 +870,8 @@ scan_hardware_errors() {
     echo ""
     echo "### PCIE_AER_ERRORS"
     echo "• DATA:"
-    local aer_errors_raw=$(safe_cmd 10 dmesg 2>/dev/null | grep -c -i "AER|PCIe.*error" || echo "0")
+    local aer_errors_raw=$(safe_cmd 10 dmesg 2>/dev/null | grep -c -iE "AER|PCIe.*error" || echo "0")
     local aer_errors=$(sanitize_num "$aer_errors_raw")
-    local aer_errors=$(safe_cmd 10 dmesg 2>/dev/null | grep -c -i "AER\|PCIe.*error" || echo "0")
     echo "  aer_error_count: $aer_errors"
     
     if [[ $aer_errors -gt 0 ]]; then
@@ -880,9 +882,8 @@ scan_hardware_errors() {
     echo ""
     echo "### USB_ERRORS"
     echo "• DATA:"
-    local usb_errors_raw=$(safe_cmd 10 dmesg 2>/dev/null | grep -c -i "usb.*reset|usb.*error" || echo "0")
+    local usb_errors_raw=$(safe_cmd 10 dmesg 2>/dev/null | grep -c -iE "usb.*reset|usb.*error" || echo "0")
     local usb_errors=$(sanitize_num "$usb_errors_raw")
-    local usb_errors=$(safe_cmd 10 dmesg 2>/dev/null | grep -c -i "usb.*reset\|usb.*error" || echo "0")
     echo "  usb_reset_error_count: $usb_errors"
     
     if [[ $usb_errors -gt 10 ]]; then
@@ -913,10 +914,11 @@ scan_logs_analysis() {
         local segfault_count=$(sanitize_num "$segfault_count_raw")
         local io_error_count_raw=$(echo "$journal_errors" | grep -c -i "I/O error" || echo "0")
         local io_error_count=$(sanitize_num "$io_error_count_raw")
-        local io_error_count=$(echo "$journal_errors" | grep -c -i "I/O error" || echo "0")
+        local oom_kills_raw=$(echo "$journal_errors" | grep -c -i "Out of memory" || echo "0")
+        local oom_kills=$(sanitize_num "$oom_kills_raw")
         
         echo "  segfault_events: $segfault_count"
-        echo "  oom_events: $oom_count"
+        echo "  oom_events: $oom_kills"
         echo "  io_error_events: $io_error_count"
         
         if [[ $segfault_count -gt 5 ]]; then
@@ -969,14 +971,14 @@ scan_config_validation() {
         
         # Проверка синтаксиса (findmnt)
         if check_tool findmnt; then
-            local fstab_verify=$(safe_cmd 10 findmnt --verify 2>&1 || echo "")
-            if [[ -n "$fstab_verify" ]] && [[ "$fstab_verify" != *"verified"* ]]; then
+            if safe_cmd 10 findmnt --verify >/dev/null 2>&1; then
+                echo "  fstab_verification: PASSED"
+            else
+                local fstab_verify=$(safe_cmd 10 findmnt --verify 2>&1 || echo "")
                 echo "  fstab_verification: FAILED"
                 echo "• RAW_LOGS:"
                 echo "$fstab_verify" | while read -r line; do echo "  $line"; done
                 add_issue "WARNING" "Ошибки в /etc/fstab" "/etc/fstab" "Исправить некорректные записи"
-            else
-                echo "  fstab_verification: PASSED"
             fi
         fi
     else
@@ -1044,10 +1046,12 @@ scan_package_management() {
             
             # Обновления
             local updates_avail=$(safe_cmd 30 apt list --upgradable 2>/dev/null | tail -n +2 | wc -l || echo "0")
+            updates_avail=$(sanitize_num "$updates_avail")
             echo "  available_updates: $updates_avail"
             
             # Битые пакеты
             local broken=$(safe_cmd 10 dpkg --audit 2>/dev/null | wc -l || echo "0")
+            broken=$(sanitize_num "$broken")
             echo "  broken_packages: $broken"
             
             if [[ $broken -gt 0 ]]; then
@@ -1056,6 +1060,7 @@ scan_package_management() {
             
             # Автоудаление
             local autoremove=$(safe_cmd 10 apt autoremove --dry-run 2>/dev/null | grep "^Remv" | wc -l || echo "0")
+            autoremove=$(sanitize_num "$autoremove")
             echo "  autoremove_candidates: $autoremove"
             ;;
             
@@ -1065,9 +1070,11 @@ scan_package_management() {
             echo "• DATA:"
             
             local updates_avail=$(safe_cmd 30 dnf check-update 2>/dev/null | tail -n +2 | wc -l || echo "0")
+            updates_avail=$(sanitize_num "$updates_avail")
             echo "  available_updates: $updates_avail"
             
             local broken=$(safe_cmd 10 dnf verify 2>/dev/null | grep -c "FAILED" || echo "0")
+            broken=$(sanitize_num "$broken")
             echo "  verification_failures: $broken"
             ;;
             
@@ -1077,10 +1084,12 @@ scan_package_management() {
             echo "• DATA:"
             
             local updates_avail=$(safe_cmd 30 pacman -Qu 2>/dev/null | wc -l || echo "0")
+            updates_avail=$(sanitize_num "$updates_avail")
             echo "  available_updates: $updates_avail"
             
             # Orphaned пакеты
             local orphaned=$(safe_cmd 10 pacman -Qdtq 2>/dev/null | wc -l || echo "0")
+            orphaned=$(sanitize_num "$orphaned")
             echo "  orphaned_packages: $orphaned"
             ;;
             
@@ -1090,6 +1099,7 @@ scan_package_management() {
             echo "• DATA:"
             
             local updates_avail=$(safe_cmd 30 zypper list-updates 2>/dev/null | tail -n +2 | wc -l || echo "0")
+            updates_avail=$(sanitize_num "$updates_avail")
             echo "  available_updates: $updates_avail"
             ;;
             
@@ -1970,15 +1980,19 @@ scan_hardware_driver_audit() {
     echo "• DATA:"
     
     if check_tool lspci; then
-        safe_cmd 15 lspci -nnk 2>/dev/null | while read -r line; do
+        local pci_output=$(safe_cmd 15 lspci -nnk 2>/dev/null || echo "")
+        local driver_in_use=""
+        echo "$pci_output" | while read -r line; do
             if [[ "$line" =~ ^[0-9a-f] ]]; then
                 # Это строка устройства
                 local pci_slot=$(echo "$line" | cut -d' ' -f1)
                 local device_desc=$(echo "$line" | cut -d':' -f2-)
                 echo "  PCI_DEVICE: $pci_slot |$device_desc"
+                driver_in_use=""
             elif [[ "$line" =~ "Kernel driver in use:" ]]; then
                 local driver=$(echo "$line" | cut -d':' -f2 | xargs)
                 echo "    DRIVER_IN_USE: $driver"
+                driver_in_use="$driver"
                 
                 # Проверка на универсальные драйверы вместо специфичных
                 if [[ "$driver" == "pcieport" ]]; then
@@ -1991,7 +2005,6 @@ scan_hardware_driver_audit() {
                 # Если нет драйвера в использовании
                 if [[ -z "$driver_in_use" ]]; then
                     echo "    WARNING: Нет активного драйвера!"
-                    ((missing_drivers++))
                 fi
             fi
         done
@@ -2031,7 +2044,8 @@ scan_hardware_driver_audit() {
         # Поиск USB устройств без драйверов
         echo ""
         echo "### USB_DRIVER_STATUS"
-        safe_cmd 10 lsusb -t 2>/dev/null | while read -r line; do
+        local lsusb_output=$(safe_cmd 10 lsusb -t 2>/dev/null || echo "")
+        echo "$lsusb_output" | while read -r line; do
             if [[ "$line" =~ Hub|Hub ]]; then
                 continue
             fi
@@ -2039,7 +2053,6 @@ scan_hardware_driver_audit() {
                 local driver=$(echo "$line" | grep -oP 'Driver=\K[^ ]*' || echo "none")
                 if [[ "$driver" == "(none)" || -z "$driver" ]]; then
                     echo "  MISSING_USB_DRIVER: $line"
-                    ((missing_drivers++))
                 else
                     echo "  USB_OK: $(echo "$line" | grep -oP '.*?(?=:)' || echo "device") | driver=$driver"
                 fi
@@ -2123,9 +2136,9 @@ scan_hardware_driver_audit() {
     echo "  Checking GPU driver matching..."
     local gpu_vendor=""
     if check_tool lspci; then
-        if safe_cmd 10 lspci -nn 2>/dev/null | grep -i "vga.*nvidia\|3d.*nvidia" >/dev/null; then
+        if safe_cmd 10 lspci -nn 2>/dev/null | grep -qiE "vga.*nvidia|3d.*nvidia"; then
             gpu_vendor="nvidia"
-            if ! lsmod 2>/dev/null | grep -qE "nvidia|nouveau"; then
+            if ! lsmod 2>/dev/null | grep -qwE "nvidia|nouveau"; then
                 echo "  MISMATCH: NVIDIA GPU detected but no nvidia/nouveau driver loaded"
                 add_issue "CRITICAL" "NVIDIA GPU без загруженного драйвера" "hardware" "Установить драйвер nvidia или nouveau"
                 ((mismatches_found++))
@@ -2133,9 +2146,9 @@ scan_hardware_driver_audit() {
                 local loaded_gpu=$(lsmod 2>/dev/null | grep -oE "nvidia[^ ]*|nouveau" | head -1)
                 echo "  GPU_MATCH: NVIDIA | driver=$loaded_gpu"
             fi
-        elif safe_cmd 10 lspci -nn 2>/dev/null | grep -i "vga.*amd\|vga.*ati\|display.*amd" >/dev/null; then
+        elif safe_cmd 10 lspci -nn 2>/dev/null | grep -qiE "vga.*amd|vga.*ati|display.*amd"; then
             gpu_vendor="amd"
-            if ! lsmod 2>/dev/null | grep -qE "amdgpu|radeon"; then
+            if ! lsmod 2>/dev/null | grep -qwE "amdgpu|radeon"; then
                 echo "  MISMATCH: AMD GPU detected but no amdgpu/radeon driver loaded"
                 add_issue "CRITICAL" "AMD GPU без загруженного драйвера" "hardware" "Установить драйвер amdgpu или radeon"
                 ((mismatches_found++))
@@ -2143,9 +2156,9 @@ scan_hardware_driver_audit() {
                 local loaded_gpu=$(lsmod 2>/dev/null | grep -oE "amdgpu|radeon" | head -1)
                 echo "  GPU_MATCH: AMD | driver=$loaded_gpu"
             fi
-        elif safe_cmd 10 lspci -nn 2>/dev/null | grep -i "vga.*intel\|display.*intel" >/dev/null; then
+        elif safe_cmd 10 lspci -nn 2>/dev/null | grep -qiE "vga.*intel|display.*intel"; then
             gpu_vendor="intel"
-            if ! lsmod 2>/dev/null | grep -qE "i915|iris"; then
+            if ! lsmod 2>/dev/null | grep -qwE "i915|iris"; then
                 echo "  MISMATCH: Intel GPU detected but no i915/iris driver loaded"
                 add_issue "WARNING" "Intel GPU без загруженного драйвера i915" "hardware" "Проверить загрузку модуля i915"
                 ((mismatches_found++))
@@ -2161,10 +2174,10 @@ scan_hardware_driver_audit() {
     echo ""
     echo "  Checking WiFi driver matching..."
     if check_tool lspci; then
-        local wifi_hw=$(safe_cmd 10 lspci -nn 2>/dev/null | grep -i "network.*wireless\|network.*802.11" || echo "")
+        local wifi_hw=$(safe_cmd 10 lspci -nn 2>/dev/null | grep -iE "network.*wireless|network.*802.11" || echo "")
         if [[ -n "$wifi_hw" ]]; then
             echo "  WIFI_HARDWARE: detected"
-            local wifi_driver=$(safe_cmd 10 lspci -k 2>/dev/null | grep -A2 -i network | grep "Kernel driver in use:" | cut -d':' -f2 | xargs || echo "")
+            local wifi_driver=$(safe_cmd 10 lspci -k 2>/dev/null | grep -A2 -iE "network" | grep "Kernel driver in use:" | cut -d':' -f2 | xargs || echo "")
             if [[ -z "$wifi_driver" ]]; then
                 echo "  MISMATCH: WiFi hardware detected but no driver loaded"
                 add_issue "CRITICAL" "WiFi адаптер без драйвера" "hardware" "Установить драйвер для WiFi"
