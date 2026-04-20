@@ -250,8 +250,503 @@ install_missing_tools() {
 }
 
 #-------------------------------------------------------------------------------
-# МОДУЛИ СКАНИРОВАНИЯ - CPU & ПРОЦЕССОРНАЯ ПОДСИСТЕМА
+# МОДУЛЬ: scan_repository_management - Управление репозиториями
 #-------------------------------------------------------------------------------
+
+scan_repository_management() {
+    local level_required=$LEVEL_MEDIUM
+    [[ $SCAN_LEVEL -lt $level_required ]] && return 0
+    
+    echo ""
+    echo "## [REPOSITORY_MANAGEMENT]"
+    echo "### CONNECTED_REPOSITORIES"
+    
+    echo "• STATUS: OK"
+    echo "• DATA:"
+    
+    detect_package_manager
+    
+    case "$PKG_MGR" in
+        apt)
+            scan_apt_repositories
+            ;;
+        dnf|yum)
+            scan_dnf_yum_repositories
+            ;;
+        pacman)
+            scan_pacman_repositories
+            ;;
+        zypper)
+            scan_zypper_repositories
+            ;;
+        *)
+            echo "  package_manager: unknown"
+            echo "  repositories: [UNAVAILABLE - unsupported package manager]"
+            add_issue "WARNING" "Неподдерживаемый пакетный менеджер" "pkg_mgr" "Ручная проверка репозиториев"
+            ;;
+    esac
+    
+    # Проверка доступных для подключения репозиториев
+    echo ""
+    echo "### AVAILABLE_REPOSITORIES"
+    scan_available_repositories
+    
+    # Проверка состояния репозиториев
+    echo ""
+    echo "### REPOSITORY_HEALTH"
+    check_repository_health
+}
+
+scan_apt_repositories() {
+    echo "  package_manager: apt/deb"
+    echo "  repository_files:"
+    
+    # Основные источники
+    if [[ -f /etc/apt/sources.list ]]; then
+        local main_sources=$(safe_cmd 5 grep -v "^#" /etc/apt/sources.list 2>/dev/null | grep -v "^$" | head -20 || echo "")
+        if [[ -n "$main_sources" ]]; then
+            echo "    /etc/apt/sources.list:"
+            echo "$main_sources" | while read -r line; do
+                local repo_url=$(echo "$line" | awk '{print $2}')
+                local repo_suite=$(echo "$line" | awk '{print $3}')
+                local repo_components=$(echo "$line" | awk '{for(i=4;i<=NF;i++) printf $i" "; print ""}')
+                echo "      - url: $repo_url"
+                echo "        suite: $repo_suite"
+                echo "        components: $repo_components"
+            done
+        else
+            echo "    /etc/apt/sources.list: [EMPTY_OR_COMMENTS_ONLY]"
+        fi
+    else
+        echo "    /etc/apt/sources.list: [NOT_FOUND]"
+    fi
+    
+    # Дополнительные источники
+    if [[ -d /etc/apt/sources.list.d ]]; then
+        echo "    /etc/apt/sources.list.d/:"
+        local deb_files=$(safe_cmd 5 ls /etc/apt/sources.list.d/*.list 2>/dev/null || echo "")
+        if [[ -n "$deb_files" ]]; then
+            for file in /etc/apt/sources.list.d/*.list; do
+                local filename=$(basename "$file")
+                local content=$(safe_cmd 5 grep -v "^#" "$file" 2>/dev/null | grep -v "^$" | head -5 || echo "")
+                if [[ -n "$content" ]]; then
+                    echo "      $filename:"
+                    echo "$content" | while read -r line; do
+                        local repo_url=$(echo "$line" | awk '{print $2}')
+                        echo "        - $repo_url"
+                    done
+                fi
+            done
+        else
+            echo "      [NO_FILES]"
+        fi
+    fi
+    
+    # Подключенные PPAs
+    if [[ -d /etc/apt/sources.list.d ]]; then
+        local ppas=$(safe_cmd 5 grep -h "ppa:" /etc/apt/sources.list.d/*.list 2>/dev/null | grep -v "^#" | head -10 || echo "")
+        if [[ -n "$ppas" ]]; then
+            echo "  ppas_detected: true"
+            echo "  ppa_list:"
+            echo "$ppas" | while read -r line; do
+                local ppa_name=$(echo "$line" | grep -oP "ppa:\K[^ ]+" || echo "")
+                if [[ -n "$ppa_name" ]]; then
+                    echo "    - $ppa_name"
+                fi
+            done
+        else
+            echo "  ppas_detected: false"
+        fi
+    fi
+    
+    # Проверка ключей репозиториев
+    echo "  repository_keys:"
+    if [[ -d /etc/apt/trusted.gpg.d ]]; then
+        local key_count=$(safe_cmd 5 ls /etc/apt/trusted.gpg.d/*.gpg 2>/dev/null | wc -l || echo "0")
+        echo "    trusted_gpg_d_count: $key_count"
+    fi
+    if command -v apt-key >/dev/null 2>&1; then
+        local apt_keys=$(safe_cmd 10 apt-key list 2>/dev/null | grep -c "pub" || echo "0")
+        echo "    apt_key_legacy_count: $apt_keys"
+    fi
+}
+
+scan_dnf_yum_repositories() {
+    echo "  package_manager: $PKG_MGR"
+    echo "  repository_files:"
+    
+    # Основные конфиги
+    if [[ -f /etc/yum.repos.d/*.repo ]]; then
+        local repo_files=$(safe_cmd 5 ls /etc/yum.repos.d/*.repo 2>/dev/null || echo "")
+        if [[ -n "$repo_files" ]]; then
+            for file in /etc/yum.repos.d/*.repo; do
+                local filename=$(basename "$file")
+                echo "    $filename:"
+                # Извлекаем активные репозитории
+                local repos=$(safe_cmd 5 grep -E "^\[.+\]" "$file" 2>/dev/null | tr -d '[]' || echo "")
+                if [[ -n "$repos" ]]; then
+                    echo "$repos" | while read -r repo; do
+                        local enabled=$(safe_cmd 5 grep -A10 "^\[$repo\]" "$file" 2>/dev/null | grep "enabled=1" | head -1 || echo "")
+                        local baseurl=$(safe_cmd 5 grep -A10 "^\[$repo\]" "$file" 2>/dev/null | grep "baseurl=" | head -1 | cut -d= -f2 || echo "")
+                        local metalink=$(safe_cmd 5 grep -A10 "^\[$repo\]" "$file" 2>/dev/null | grep "metalink=" | head -1 | cut -d= -f2 || echo "")
+                        if [[ -n "$enabled" ]]; then
+                            echo "      - name: $repo [ENABLED]"
+                            echo "        url: ${baseurl:-$metalink}"
+                        fi
+                    done
+                fi
+            done
+        fi
+    else
+        echo "    /etc/yum.repos.d/: [NO_REPO_FILES]"
+    fi
+    
+    # Список включенных репозиториев через dnf/yum
+    echo "  active_repositories:"
+    if check_tool dnf; then
+        safe_cmd 15 dnf repolist enabled 2>/dev/null | tail -n +2 | while read -r repo_id repo_name; do
+            if [[ -n "$repo_id" ]]; then
+                echo "    - id: $repo_id"
+                echo "      name: $repo_name"
+            fi
+        done
+    elif check_tool yum; then
+        safe_cmd 15 yum repolist enabled 2>/dev/null | tail -n +2 | while read -r repo_id repo_name; do
+            if [[ -n "$repo_id" ]]; then
+                echo "    - id: $repo_id"
+                echo "      name: $repo_name"
+            fi
+        done
+    fi
+}
+
+scan_pacman_repositories() {
+    echo "  package_manager: pacman"
+    echo "  repository_config: /etc/pacman.conf"
+    
+    if [[ -f /etc/pacman.conf ]]; then
+        echo "  repositories:"
+        local repos=$(safe_cmd 5 grep -E "^\[.+\]" /etc/pacman.conf 2>/dev/null | tr -d '[]' || echo "")
+        echo "$repos" | while read -r repo; do
+            if [[ "$repo" != "options" ]]; then
+                local servers=$(safe_cmd 5 grep -A5 "^\[$repo\]" /etc/pacman.conf 2>/dev/null | grep "Server =" | head -3 || echo "")
+                echo "    - name: $repo"
+                if [[ -n "$servers" ]]; then
+                    echo "      servers:"
+                    echo "$servers" | sed 's/.*Server = /        - /'
+                fi
+            fi
+        done
+    else
+        echo "  pacman_conf: [NOT_FOUND]"
+    fi
+    
+    # AUR helpers
+    echo "  aur_helpers:"
+    local aur_helpers=("yay" "paru" "aura" "pacaur" "trizen")
+    local detected_aur=""
+    for helper in "${aur_helpers[@]}"; do
+        if check_tool "$helper"; then
+            detected_aur="$helper"
+            echo "    - $helper [DETECTED]"
+        fi
+    done
+    if [[ -z "$detected_aur" ]]; then
+        echo "    [NONE_DETECTED]"
+        add_issue "INFO" "AUR helper не установлен" "aur" "Рекомендуется установить yay или paru для доступа к AUR"
+    fi
+}
+
+scan_zypper_repositories() {
+    echo "  package_manager: zypper"
+    echo "  repository_files: /etc/zypp/repos.d/"
+    
+    if [[ -d /etc/zypp/repos.d ]]; then
+        local repo_files=$(safe_cmd 5 ls /etc/zypp/repos.d/*.repo 2>/dev/null || echo "")
+        if [[ -n "$repo_files" ]]; then
+            echo "  repositories:"
+            for file in /etc/zypp/repos.d/*.repo; do
+                local filename=$(basename "$file")
+                local repo_name=$(safe_cmd 5 grep "^name=" "$file" 2>/dev/null | head -1 | cut -d= -f2 || echo "")
+                local repo_url=$(safe_cmd 5 grep "^baseurl=" "$file" 2>/dev/null | head -1 | cut -d= -f2 || echo "")
+                local repo_enabled=$(safe_cmd 5 grep "^enabled=" "$file" 2>/dev/null | head -1 | cut -d= -f2 || echo "1")
+                
+                if [[ "$repo_enabled" == "1" ]]; then
+                    echo "    - file: $filename"
+                    echo "      name: $repo_name"
+                    echo "      url: $repo_url"
+                    echo "      status: ENABLED"
+                fi
+            done
+        else
+            echo "  [NO_REPO_FILES]"
+        fi
+    fi
+    
+    # Список через zypper
+    echo "  zypper_repolist:"
+    if check_tool zypper; then
+        safe_cmd 15 zypper repos --uri 2>/dev/null | tail -n +4 | while read -r line; do
+            if [[ -n "$line" ]]; then
+                echo "    $line"
+            fi
+        done
+    fi
+}
+
+scan_available_repositories() {
+    echo "• DATA:"
+    
+    detect_package_manager
+    
+    case "$PKG_MGR" in
+        apt)
+            suggest_apt_repositories
+            ;;
+        dnf|yum)
+            suggest_dnf_yum_repositories
+            ;;
+        pacman)
+            suggest_pacman_repositories
+            ;;
+        zypper)
+            suggest_zypper_repositories
+            ;;
+        *)
+            echo "  recommendations: [UNAVAILABLE - unsupported package manager]"
+            ;;
+    esac
+}
+
+suggest_apt_repositories() {
+    local distro_codename=""
+    if [[ -f /etc/os-release ]]; then
+        distro_codename=$(safe_cmd 5 grep "VERSION_CODENAME=" /etc/os-release 2>/dev/null | cut -d= -f2 || echo "")
+    fi
+    
+    if [[ -z "$distro_codename" ]]; then
+        distro_codename=$(lsb_release -cs 2>/dev/null || echo "unknown")
+    fi
+    
+    echo "  distribution_codename: $distro_codename"
+    echo "  recommended_repositories:"
+    
+    # Проверка основных репозиториев
+    local has_main=false
+    local has_universe=false
+    local has_multiverse=false
+    local has_restricted=false
+    
+    if [[ -f /etc/apt/sources.list ]]; then
+        grep -q " main " /etc/apt/sources.list 2>/dev/null && has_main=true
+        grep -q " universe " /etc/apt/sources.list 2>/dev/null && has_universe=true
+        grep -q " multiverse " /etc/apt/sources.list 2>/dev/null && has_multiverse=true
+        grep -q " restricted " /etc/apt/sources.list 2>/dev/null && has_restricted=true
+    fi
+    
+    # Рекомендации
+    if [[ "$has_main" != "true" ]]; then
+        echo "    - repository: main"
+        echo "      status: MISSING"
+        echo "      recommendation: Основной репозиторий Ubuntu/Debian"
+        echo "      add_command: sudo add-apt-repository main"
+    fi
+    
+    if [[ "$has_universe" != "true" ]]; then
+        echo "    - repository: universe"
+        echo "      status: MISSING"
+        echo "      recommendation: Сообщество поддерживаемые пакеты"
+        echo "      add_command: sudo add-apt-repository universe"
+    fi
+    
+    if [[ "$has_multiverse" != "true" ]]; then
+        echo "    - repository: multiverse"
+        echo "      status: MISSING"
+        echo "      recommendation: Проприетарное ПО"
+        echo "      add_command: sudo add-apt-repository multiverse"
+    fi
+    
+    if [[ "$has_restricted" != "true" ]]; then
+        echo "    - repository: restricted"
+        echo "      status: MISSING"
+        echo "      recommendation: Проприетарные драйверы"
+        echo "      add_command: sudo add-apt-repository restricted"
+    fi
+    
+    # Популярные PPAs
+    echo "  popular_ppas:"
+    echo "    - ppa:graphics-drivers"
+    echo "      description: Свежие драйверы NVIDIA"
+    echo "      add_command: sudo add-apt-repository ppa:graphics-drivers/ppa"
+    echo "    - ppa:kisak-mesa"
+    echo "      description: Обновленные Mesa драйверы"
+    echo "      add_command: sudo add-apt-repository ppa:kisak-mesa/kisak-mesa"
+    echo "    - ppa:deadsnakes"
+    echo "      description: Дополнительные версии Python"
+    echo "      add_command: sudo add-apt-repository ppa:deadsnakes/ppa"
+    echo "    - ppa:longsleep/golang-backports"
+    echo "      description: Свежие версии Go"
+    echo "      add_command: sudo add-apt-repository ppa:longsleep/golang-backports"
+}
+
+suggest_dnf_yum_repositories() {
+    echo "  recommended_repositories:"
+    
+    # EPEL для RHEL/CentOS/Fedora
+    if ! safe_cmd 10 dnf repolist 2>/dev/null | grep -q epel && ! safe_cmd 10 yum repolist 2>/dev/null | grep -q epel; then
+        echo "    - repository: EPEL"
+        echo "      status: NOT_ENABLED"
+        echo "      recommendation: Extra Packages for Enterprise Linux"
+        if check_tool dnf; then
+            echo "      add_command: sudo dnf install -y epel-release"
+        else
+            echo "      add_command: sudo yum install -y epel-release"
+        fi
+    else
+        echo "    - repository: EPEL"
+        echo "      status: ENABLED"
+    fi
+    
+    # RPM Fusion для Fedora
+    if safe_cmd 5 cat /etc/os-release 2>/dev/null | grep -qi "fedora"; then
+        if ! safe_cmd 10 dnf repolist 2>/dev/null | grep -q "rpmfusion"; then
+            echo "    - repository: RPM Fusion Free"
+            echo "      status: NOT_ENABLED"
+            echo "      recommendation: Мультимедиа и проприетарное ПО для Fedora"
+            echo "      add_command: sudo dnf install -y https://download1.rpmfusion.org/free/fedora/rpmfusion-free-release-\$(rpm -E %fedora).noarch.rpm"
+            echo "    - repository: RPM Fusion Non-Free"
+            echo "      status: NOT_ENABLED"
+            echo "      add_command: sudo dnf install -y https://download1.rpmfusion.org/nonfree/fedora/rpmfusion-nonfree-release-\$(rpm -E %fedora).noarch.rpm"
+        fi
+    fi
+    
+    # PowerTools/CRB
+    if safe_cmd 5 cat /etc/os-release 2>/dev/null | grep -qi "centos\|rocky\|almalinux"; then
+        echo "    - repository: CRB/PowerTools"
+        echo "      status: CHECK_AVAILABILITY"
+        echo "      recommendation: Дополнительные пакеты разработки"
+        if check_tool dnf; then
+            echo "      add_command: sudo dnf config-manager --set-enabled crb"
+        fi
+    fi
+}
+
+suggest_pacman_repositories() {
+    echo "  recommended_setup:"
+    
+    # Проверка multilib
+    local has_multilib=false
+    if [[ -f /etc/pacman.conf ]]; then
+        grep -q "^\[multilib\]" /etc/pacman.conf 2>/dev/null && has_multilib=true
+    fi
+    
+    if [[ "$has_multilib" != "true" ]]; then
+        echo "    - repository: multilib"
+        echo "      status: DISABLED"
+        echo "      recommendation: 32-битные пакеты для 64-битной системы"
+        echo "      add_instructions:"
+        echo "        1. Откройте /etc/pacman.conf"
+        echo "        2. Раскомментируйте строки [multilib] и Include = /etc/pacman.d/mirrorlist"
+        echo "        3. Выполните: sudo pacman -Syu"
+    else
+        echo "    - repository: multilib"
+        echo "      status: ENABLED"
+    fi
+    
+    # AUR рекомендации
+    echo "  aur_setup:"
+    if ! check_tool yay && ! check_tool paru; then
+        echo "    - helper: yay"
+        echo "      status: NOT_INSTALLED"
+        echo "      recommendation: Популярный AUR хелпер"
+        echo "      install_command: git clone https://aur.archlinux.org/yay.git && cd yay && makepkg -si"
+    fi
+}
+
+suggest_zypper_repositories() {
+    echo "  recommended_repositories:"
+    
+    # Packman для openSUSE
+    if ! safe_cmd 10 zypper repos 2>/dev/null | grep -qi packman; then
+        echo "    - repository: Packman"
+        echo "      status: NOT_ENABLED"
+        echo "      recommendation: Мультимедиа кодеки и дополнительные пакеты"
+        echo "      add_command: sudo zypper addrepo -cfp 90 http://packman.inode.at/suse/openSUSE_Tumbleweed/ packman"
+        echo "      note: Замените openSUSE_Tumbleweed на вашу версию (Leap_15.x, etc.)"
+    else
+        echo "    - repository: Packman"
+        echo "      status: ENABLED"
+    fi
+    
+    # Open Build Service
+    echo "  obs_repositories:"
+    echo "    - description: Open Build Service предоставляет пакеты для многих приложений"
+    echo "      url: https://software.opensuse.org/download.html"
+    echo "      note: Используйте YaST или zypper addrepo для добавления"
+}
+
+check_repository_health() {
+    echo "• DATA:"
+    
+    detect_package_manager
+    
+    case "$PKG_MGR" in
+        apt)
+            # Проверка обновлений списков
+            echo "  last_update_check:"
+            if [[ -f /var/lib/apt/periodic/update-success-stamp ]]; then
+                local last_update=$(safe_cmd 5 stat -c %y /var/lib/apt/periodic/update-success-stamp 2>/dev/null | cut -d' ' -f1 || echo "unknown")
+                echo "    last_successful_update: $last_update"
+            elif [[ -f /var/lib/apt/lists ]]; then
+                local lists_age=$(safe_cmd 5 find /var/lib/apt/lists -mtime +7 2>/dev/null | wc -l || echo "0")
+                if [[ "$lists_age" -gt 0 ]]; then
+                    echo "    warning: Некоторые списки пакетов старше 7 дней"
+                    echo "    recommendation: sudo apt update"
+                    add_issue "WARNING" "Устаревшие списки пакетов" "apt_lists" "Выполнить sudo apt update"
+                fi
+            fi
+            
+            # Проверка на broken пакеты
+            local broken_count=$(safe_cmd 10 apt-get check 2>&1 | grep -c "broken" || echo "0")
+            echo "    broken_packages_detected: $broken_count"
+            ;;
+            
+        dnf|yum)
+            echo "  repository_sync_status:"
+            if check_tool dnf; then
+                local last_metadata=$(safe_cmd 5 find /var/cache/dnf -name "metadata_expire" -mmin +1440 2>/dev/null | wc -l || echo "0")
+                if [[ "$last_metadata" -gt 0 ]]; then
+                    echo "    warning: Метаданные репозиториев устарели"
+                    echo "    recommendation: sudo dnf makecache"
+                fi
+            fi
+            ;;
+            
+        pacman)
+            echo "  database_sync_status:"
+            if [[ -d /var/lib/pacman/db ]]; then
+                local db_age=$(safe_cmd 5 find /var/lib/pacman/db -mtime +7 2>/dev/null | wc -l || echo "0")
+                if [[ "$db_age" -gt 0 ]]; then
+                    echo "    warning: База данных пакетов старше 7 дней"
+                    echo "    recommendation: sudo pacman -Sy"
+                fi
+            fi
+            ;;
+            
+        zypper)
+            echo "  refresh_status:"
+            local stale_repos=$(safe_cmd 10 zypper list-repositories 2>/dev/null | grep -c "Outdated" || echo "0")
+            echo "    outdated_repositories: $stale_repos"
+            if [[ "$stale_repos" -gt 0 ]]; then
+                echo "    recommendation: sudo zypper refresh"
+            fi
+            ;;
+    esac
+    
+    # Общая проверка доступности репозиториев
+    echo "  connectivity_test:"
+    echo "    note: Проверка доступности зеркал требует сетевого подключения"
+}
 
 scan_basic_info() {
     local level_required=$LEVEL_MINIMAL
@@ -2246,7 +2741,7 @@ run_scan() {
     echo ""
     
     local step=0
-    local total_steps=21
+    local total_steps=22
     
     # Helper для вывода прогресса
     print_progress() {
@@ -2306,6 +2801,10 @@ run_scan() {
         print_progress "Управление пакетами" "RUNNING"
         scan_package_management
         print_progress "Управление пакетами" "OK"
+        
+        print_progress "Сканирование репозиториев" "RUNNING"
+        scan_repository_management
+        print_progress "Сканирование репозиториев" "OK"
         
         print_progress "Все установленные пакеты" "RUNNING"
         scan_all_installed_packages
