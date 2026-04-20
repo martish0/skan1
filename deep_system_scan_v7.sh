@@ -8,7 +8,7 @@
 #-------------------------------------------------------------------------------
 # НАСТРОЙКИ И КОНСТАНТЫ
 #-------------------------------------------------------------------------------
-set -o pipefail
+set -uo pipefail
 # set -e НЕ используется для продолжения сканирования при ошибках
 
 readonly SCRIPT_VERSION="7.1"
@@ -82,6 +82,24 @@ safe_sudo_cmd() {
     # Теперь safe_cmd уже выполняет команды через sudo, поэтому просто вызываем его
     safe_cmd "$timeout_sec" "$@"
     return $?
+}
+
+# sanitize_num - очистка строки от нечисловых символов для безопасного сравнения
+# Удаляет: символы перевода строки (\n), лишние пробелы, табуляции, нецифровые символы
+# Возвращает: чистое число или 0 если строка пустая/некорректная
+sanitize_num() {
+    local input="$1"
+    local cleaned
+    
+    # Удаляем все нецифровые символы кроме минуса для отрицательных чисел
+    cleaned=$(echo "$input" | tr -d '\n\r\t' | tr -s ' ' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | grep -oE '^-?[0-9]+' | head -1)
+    
+    # Если результат пустой или только минус, возвращаем 0
+    if [[ -z "$cleaned" ]] || [[ "$cleaned" == "-" ]]; then
+        echo "0"
+    else
+        echo "$cleaned"
+    fi
 }
 
 # check_tool - проверка наличия утилиты
@@ -466,7 +484,8 @@ scan_memory_detailed() {
     echo "### OOM_STATISTICS"
     echo "• DATA:"
     
-    local oom_kills=$(safe_cmd 5 dmesg 2>/dev/null | grep -c "Out of memory" || echo "0")
+    local oom_kills_raw=$(safe_cmd 5 dmesg 2>/dev/null | grep -c "Out of memory" || echo "0")
+    local oom_kills=$(sanitize_num "$oom_kills_raw")
     echo "  oom_kills_count: $oom_kills"
     
     if [[ $oom_kills -gt 0 ]]; then
@@ -500,7 +519,7 @@ scan_storage_detailed() {
         echo "    mount: $mount"
         
         # Проверка на заполненность
-        local use_num=${use_pct%\%}
+        local use_num=$(sanitize_num "${use_pct%\\%}")
         if [[ $use_num -gt 95 ]]; then
             add_issue "CRITICAL" "Диск заполнен > 95%" "$mount" "Очистить место или расширить раздел"
         elif [[ $use_num -gt 85 ]]; then
@@ -515,7 +534,7 @@ scan_storage_detailed() {
     
     safe_cmd 10 df -i 2>/dev/null | tail -n +2 | while read -r filesystem inodes iused ifree iuse_pct mounted; do
         [[ "$filesystem" == "tmpfs" ]] && continue
-        local iuse_num=${iuse_pct%\%}
+        local iuse_num=$(sanitize_num "${iuse_pct%\\%}")
         if [[ $iuse_num -gt 90 ]]; then
             echo "  WARNING: $filesystem inode usage: $iuse_pct"
             add_issue "WARNING" "Высокое использование inodes" "$mounted" "Найти и удалить мелкие файлы"
@@ -543,7 +562,7 @@ scan_storage_detailed() {
             fi
             
             # Reallocated sectors
-            local reallocated=$(safe_cmd 30 smartctl -A "$disk" 2>/dev/null | grep -i "Reallocated_Sector" | awk '{print $NF}' || echo "0")
+            local reallocated=$(sanitize_num "$(safe_cmd 30 smartctl -A "$disk" 2>/dev/null | grep -i "Reallocated_Sector" | awk '{ print $NF }' || echo "0")")
             echo "  reallocated_sectors: $reallocated"
             
             if [[ $reallocated -gt 0 ]]; then
@@ -551,7 +570,7 @@ scan_storage_detailed() {
                 add_prohibition "Игнорировать рост Reallocated_Sector_Ct" "$disk" "Подготовить замену диска"
             fi
             
-            # Power-on hours
+            local poh=$(sanitize_num "$(safe_cmd 30 smartctl -A "$disk" 2>/dev/null | grep -i "Power_On_Hours" | awk '{ print $NF }' || echo "0")")
             local poh=$(safe_cmd 30 smartctl -A "$disk" 2>/dev/null | grep -i "Power_On_Hours" | awk '{print $NF}' || echo "0")
             echo "  power_on_hours: $poh"
         done
@@ -685,7 +704,7 @@ scan_thermal_cooling() {
             # Проверка на перегрев
             local high_temp=$(echo "$sensors_output" | grep -E "Package id 0|Core|Tdie" | grep -oE '[0-9]+\.[0-9]+' | sort -rn | head -1 || echo "0")
             if [[ -n "$high_temp" ]]; then
-                local temp_int=${high_temp%.*}
+                local temp_int=$(sanitize_num "${high_temp%.*}")
                 if [[ $temp_int -gt 90 ]]; then
                     add_issue "CRITICAL" "Критическая температура CPU > 90°C" "thermal" "Проверить систему охлаждения, заменить термопасту"
                 elif [[ $temp_int -gt 80 ]]; then
@@ -835,7 +854,8 @@ scan_hardware_errors() {
     echo "• STATUS: OK"
     echo "• DATA:"
     
-    local mce_count=$(safe_cmd 10 dmesg 2>/dev/null | grep -c -i "MCE\|Machine Check" || echo "0")
+    local mce_count_raw=$(safe_cmd 10 dmesg 2>/dev/null | grep -c -i "MCE|Machine Check" || echo "0")
+    local mce_count=$(sanitize_num "$mce_count_raw")
     echo "  mce_events: $mce_count"
     
     if [[ $mce_count -gt 0 ]]; then
@@ -847,7 +867,8 @@ scan_hardware_errors() {
     echo ""
     echo "### PCIE_AER_ERRORS"
     echo "• DATA:"
-    
+    local aer_errors_raw=$(safe_cmd 10 dmesg 2>/dev/null | grep -c -i "AER|PCIe.*error" || echo "0")
+    local aer_errors=$(sanitize_num "$aer_errors_raw")
     local aer_errors=$(safe_cmd 10 dmesg 2>/dev/null | grep -c -i "AER\|PCIe.*error" || echo "0")
     echo "  aer_error_count: $aer_errors"
     
@@ -859,7 +880,8 @@ scan_hardware_errors() {
     echo ""
     echo "### USB_ERRORS"
     echo "• DATA:"
-    
+    local usb_errors_raw=$(safe_cmd 10 dmesg 2>/dev/null | grep -c -i "usb.*reset|usb.*error" || echo "0")
+    local usb_errors=$(sanitize_num "$usb_errors_raw")
     local usb_errors=$(safe_cmd 10 dmesg 2>/dev/null | grep -c -i "usb.*reset\|usb.*error" || echo "0")
     echo "  usb_reset_error_count: $usb_errors"
     
@@ -887,8 +909,10 @@ scan_logs_analysis() {
         echo "  error_count_current_boot: $error_count"
         
         # Поиск паттернов
-        local segfault_count=$(echo "$journal_errors" | grep -c "segfault" || echo "0")
-        local oom_count=$(echo "$journal_errors" | grep -c -i "out of memory" || echo "0")
+        local segfault_count_raw=$(echo "$journal_errors" | grep -c "segfault" || echo "0")
+        local segfault_count=$(sanitize_num "$segfault_count_raw")
+        local io_error_count_raw=$(echo "$journal_errors" | grep -c -i "I/O error" || echo "0")
+        local io_error_count=$(sanitize_num "$io_error_count_raw")
         local io_error_count=$(echo "$journal_errors" | grep -c -i "I/O error" || echo "0")
         
         echo "  segfault_events: $segfault_count"
