@@ -1,0 +1,1607 @@
+#!/bin/bash
+#===============================================================================
+# DEEP SYSTEM SCAN v7 - Производственный диагностический инструмент
+# READ-ONLY сканирование системы с генерацией отчёта для ИИ-анализа
+# Версия: 7.0 | Лицензия: MIT | Автор: Senior Linux Engineer
+#===============================================================================
+
+#-------------------------------------------------------------------------------
+# НАСТРОЙКИ И КОНСТАНТЫ
+#-------------------------------------------------------------------------------
+set -o pipefail
+# set -e НЕ используется для продолжения сканирования при ошибках
+
+readonly SCRIPT_VERSION="7.0"
+readonly SCRIPT_NAME="deep_system_scan_v7.sh"
+readonly TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+readonly HOSTNAME_SHORT=$(hostname -s 2>/dev/null || echo "unknown")
+readonly OUTPUT_FILENAME="DEEP_SCAN_${HOSTNAME_SHORT}_${TIMESTAMP}.log"
+
+# Уровни сканирования
+readonly LEVEL_MINIMAL=1
+readonly LEVEL_MEDIUM=2
+readonly LEVEL_TOTAL=3
+readonly LEVEL_PROFILING=4
+
+# Глобальные переменные
+SCAN_LEVEL=0
+OUTPUT_FILE=""
+TARGET_DIR=""
+declare -a CRITICAL_ISSUES=()
+declare -a WARNING_ISSUES=()
+declare -a INFO_ISSUES=()
+declare -a STRICT_PROHIBITIONS=()
+PKG_MGR=""
+AUTO_INSTALL=false
+FORCE_PROFILING=false
+
+# Цвета для терминала (если поддерживаются)
+if [[ -t 1 ]]; then
+    readonly COLOR_RED='\033[0;31m'
+    readonly COLOR_GREEN='\033[0;32m'
+    readonly COLOR_YELLOW='\033[0;33m'
+    readonly COLOR_BLUE='\033[0;34m'
+    readonly COLOR_RESET='\033[0m'
+else
+    readonly COLOR_RED=''
+    readonly COLOR_GREEN=''
+    readonly COLOR_YELLOW=''
+    readonly COLOR_BLUE=''
+    readonly COLOR_RESET=''
+fi
+
+#-------------------------------------------------------------------------------
+# ОБРАБОТКА ПРЕРЫВАНИЙ
+#-------------------------------------------------------------------------------
+trap 'echo -e "\n${COLOR_YELLOW}⚠️ Сканирование прервано пользователем.${COLOR_RESET}"; exit 130' INT TERM
+
+#-------------------------------------------------------------------------------
+# ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
+#-------------------------------------------------------------------------------
+
+# safe_cmd - выполнение команды с таймаутом и обработкой ошибок
+safe_cmd() {
+    local timeout_sec=${1:-15}
+    shift
+    timeout "$timeout_sec" "$@" 2>/dev/null
+    return $?
+}
+
+# safe_sudo_cmd - выполнение sudo-команды с проверкой прав
+safe_sudo_cmd() {
+    local timeout_sec=${1:-15}
+    shift
+    
+    if ! sudo -n true 2>/dev/null; then
+        echo "[NEEDS_ROOT]"
+        return 1
+    fi
+    
+    timeout "$timeout_sec" sudo "$@" 2>/dev/null
+    return $?
+}
+
+# check_tool - проверка наличия утилиты
+check_tool() {
+    local tool="$1"
+    command -v "$tool" >/dev/null 2>&1
+    return $?
+}
+
+# print_status - вывод статуса с цветом
+print_status() {
+    local status="$1"
+    local message="$2"
+    
+    case "$status" in
+        OK)       echo -e "${COLOR_GREEN}[OK]${COLOR_RESET} $message" ;;
+        WARNING)  echo -e "${COLOR_YELLOW}[WARNING]${COLOR_RESET} $message" ;;
+        CRITICAL) echo -e "${COLOR_RED}[CRITICAL]${COLOR_RESET} $message" ;;
+        SKIPPED)  echo -e "${COLOR_BLUE}[SKIPPED]${COLOR_RESET} $message" ;;
+        *)        echo "[$status] $message" ;;
+    esac
+}
+
+# detect_package_manager - автодетект пакетного менеджера
+detect_package_manager() {
+    if check_tool apt-get; then
+        PKG_MGR="apt"
+    elif check_tool dnf; then
+        PKG_MGR="dnf"
+    elif check_tool yum; then
+        PKG_MGR="yum"
+    elif check_tool pacman; then
+        PKG_MGR="pacman"
+    elif check_tool zypper; then
+        PKG_MGR="zypper"
+    else
+        PKG_MGR="unknown"
+    fi
+}
+
+# add_issue - добавление проблемы в массив
+add_issue() {
+    local severity="$1"
+    local description="$2"
+    local target="$3"
+    local recommendation="$4"
+    
+    case "$severity" in
+        CRITICAL)
+            CRITICAL_ISSUES+=("[CRITICAL] $description | $target | $recommendation")
+            ;;
+        WARNING)
+            WARNING_ISSUES+=("[WARNING] $description | $target | $recommendation")
+            ;;
+        INFO)
+            INFO_ISSUES+=("[INFO] $description | $target | $recommendation")
+            ;;
+    esac
+}
+
+# add_prohibition - добавление запрета
+add_prohibition() {
+    local action="$1"
+    local reason="$2"
+    local alternative="$3"
+    
+    STRICT_PROHIBITIONS+=("[НЕ ДЕЛАТЬ] $action | $reason | $alternative")
+}
+
+#-------------------------------------------------------------------------------
+# ФУНКЦИЯ: check_and_install_tools - Проверка и установка утилит
+#-------------------------------------------------------------------------------
+check_and_install_tools() {
+    local missing_tools=()
+    local tools_list=(
+        "smartctl" "sensors" "dmidecode" "perf" "stress-ng" "fio"
+        "edac-util" "bpftrace" "nvme-cli" "ethtool" "ipmitool"
+        "fwupdmgr" "powertop" "turbostat" "inxi" "hw-probe"
+        "lm-sensors" "sysstat" "lscpu" "lsblk" "lsmod" "systemctl"
+        "journalctl" "dmesg" "ss" "ip" "df" "free" "top" "ps"
+    )
+    
+    echo ""
+    echo "═══════════════════════════════════════════════════════════"
+    echo "🔍 Проверка необходимых утилит..."
+    echo "═══════════════════════════════════════════════════════════"
+    
+    for tool in "${tools_list[@]}"; do
+        # Нормализация имени для проверки (дефисы на подчёркивания для некоторых пакетов)
+        local pkg_name="$tool"
+        case "$tool" in
+            smartctl) pkg_name="smartmontools" ;;
+            sensors|lm-sensors) pkg_name="lm-sensors" ;;
+            dmidecode) pkg_name="dmidecode" ;;
+            edac-util) pkg_name="edac-utils" ;;
+            nvme-cli) pkg_name="nvme-cli" ;;
+            ipmitool) pkg_name="ipmitool" ;;
+            fwupdmgr) pkg_name="fwupd" ;;
+            stress-ng) pkg_name="stress-ng" ;;
+            hw-probe) pkg_name="hw-probe" ;;
+            sysstat) pkg_name="sysstat" ;;
+        esac
+        
+        if ! check_tool "$tool"; then
+            missing_tools+=("$pkg_name")
+            echo -e "${COLOR_YELLOW}[MISSING]${COLOR_RESET} $tool (пакет: $pkg_name)"
+        fi
+    done
+    
+    if [[ ${#missing_tools[@]} -eq 0 ]]; then
+        echo -e "${COLOR_GREEN}✅ Все необходимые утилиты установлены${COLOR_RESET}"
+        return 0
+    fi
+    
+    echo ""
+    echo "⚠️ Отсутствуют утилиты: ${missing_tools[*]}"
+    
+    if [[ "$AUTO_INSTALL" == "true" ]]; then
+        echo "📦 Автоматическая установка включена (--auto-install)"
+        install_missing_tools "${missing_tools[@]}"
+    else
+        echo ""
+        read -p "Установить недостающие утилиты? [y/N]: " confirm
+        if [[ "$confirm" =~ ^[Yy]$ ]]; then
+            install_missing_tools "${missing_tools[@]}"
+        else
+            echo -e "${COLOR_YELLOW}⚠️ Некоторые разделы отчёта могут быть неполными${COLOR_RESET}"
+        fi
+    fi
+}
+
+install_missing_tools() {
+    local -a tools_to_install=("$@")
+    local install_cmd=""
+    
+    detect_package_manager
+    
+    case "$PKG_MGR" in
+        apt)
+            install_cmd="sudo apt-get install -y ${tools_to_install[*]}"
+            ;;
+        dnf|yum)
+            install_cmd="sudo dnf install -y ${tools_to_install[*]}"
+            [[ "$PKG_MGR" == "yum" ]] && install_cmd="sudo yum install -y ${tools_to_install[*]}"
+            ;;
+        pacman)
+            install_cmd="sudo pacman -S --noconfirm ${tools_to_install[*]}"
+            ;;
+        zypper)
+            install_cmd="sudo zypper install -y ${tools_to_install[*]}"
+            ;;
+        *)
+            echo -e "${COLOR_RED}❌ Не удалось определить пакетный менеджер${COLOR_RESET}"
+            return 1
+            ;;
+    esac
+    
+    echo ""
+    echo "📦 Команда установки: $install_cmd"
+    echo ""
+    
+    if eval "$install_cmd"; then
+        echo ""
+        echo -e "${COLOR_GREEN}📦 Установлены пакеты: ${tools_to_install[*]}${COLOR_RESET}"
+        echo "Для удаления выполните: sudo $PKG_MGR remove ${tools_to_install[*]}"
+    else
+        echo -e "${COLOR_RED}❌ Ошибка установки пакетов${COLOR_RESET}"
+    fi
+}
+
+#-------------------------------------------------------------------------------
+# МОДУЛИ СКАНИРОВАНИЯ - CPU & ПРОЦЕССОРНАЯ ПОДСИСТЕМА
+#-------------------------------------------------------------------------------
+
+scan_basic_info() {
+    local level_required=$LEVEL_MINIMAL
+    [[ $SCAN_LEVEL -lt $level_required ]] && return 0
+    
+    echo ""
+    echo "## [BASIC_INFO]"
+    echo "### SYSTEM_IDENTITY"
+    
+    local hostname_val=$(safe_cmd 5 hostname 2>/dev/null || echo "[UNAVAILABLE]")
+    local kernel_ver=$(safe_cmd 5 uname -r 2>/dev/null || echo "[UNAVAILABLE]")
+    local arch=$(safe_cmd 5 uname -m 2>/dev/null || echo "[UNAVAILABLE]")
+    local uptime_raw=$(safe_cmd 5 cat /proc/uptime 2>/dev/null | cut -d. -f1 || echo "0")
+    local uptime_days=$((uptime_raw / 86400))
+    local uptime_hours=$(( (uptime_raw % 86400) / 3600 ))
+    local distro_info=$(safe_cmd 5 cat /etc/os-release 2>/dev/null | grep "^PRETTY_NAME=" | cut -d'"' -f2 || echo "[UNKNOWN]")
+    
+    echo "• STATUS: OK"
+    echo "• DATA:"
+    echo "  hostname: $hostname_val"
+    echo "  kernel: $kernel_ver"
+    echo "  architecture: $arch"
+    echo "  uptime_days: $uptime_days"
+    echo "  uptime_hours: $uptime_hours"
+    echo "  distro: $distro_info"
+    
+    # Проверка на критические проблемы
+    if [[ $uptime_days -gt 365 ]]; then
+        add_issue "WARNING" "Система не перезагружалась более года" "uptime" "Планируемая перезагрузка для применения обновлений"
+    fi
+}
+
+scan_cpu_detailed() {
+    local level_required=$LEVEL_MINIMAL
+    [[ $SCAN_LEVEL -lt $level_required ]] && return 0
+    
+    echo ""
+    echo "## [CPU_DETAILED]"
+    echo "### CPU_BASIC"
+    
+    echo "• STATUS: OK"
+    echo "• DATA:"
+    
+    # Базовая информация из /proc/cpuinfo
+    local cpu_model=$(safe_cmd 5 grep "model name" /proc/cpuinfo 2>/dev/null | head -1 | cut -d: -f2 | xargs || echo "[UNAVAILABLE]")
+    local cpu_vendor=$(safe_cmd 5 grep "vendor_id" /proc/cpuinfo 2>/dev/null | head -1 | cut -d: -f2 | xargs || echo "[UNAVAILABLE]")
+    local cpu_family=$(safe_cmd 5 grep "cpu family" /proc/cpuinfo 2>/dev/null | head -1 | cut -d: -f2 | xargs || echo "[UNAVAILABLE]")
+    local cpu_flags=$(safe_cmd 5 grep "flags" /proc/cpuinfo 2>/dev/null | head -1 | cut -d: -f2 | xargs || echo "[UNAVAILABLE]")
+    
+    echo "  model: $cpu_model"
+    echo "  vendor: $cpu_vendor"
+    echo "  family: $cpu_family"
+    echo "  flags_preview: ${cpu_flags:0:100}..."
+    
+    # Подсчёт ядер
+    local phys_cores=$(safe_cmd 5 nproc --all 2>/dev/null || safe_cmd 5 grep -c "^processor" /proc/cpuinfo || echo "0")
+    local log_cores=$(safe_cmd 5 nproc 2>/dev/null || echo "$phys_cores")
+    
+    echo "  physical_cores: $phys_cores"
+    echo "  logical_cores: $log_cores"
+    
+    # Частоты
+    echo ""
+    echo "### CPU_FREQUENCIES"
+    echo "• DATA:"
+    
+    if [[ -f /proc/cpuinfo ]]; then
+        local cpu_mhz=$(safe_cmd 5 grep "cpu MHz" /proc/cpuinfo 2>/dev/null | head -1 | cut -d: -f2 | xargs || echo "[UNAVAILABLE]")
+        echo "  current_mhz: $cpu_mhz"
+    fi
+    
+    # Governor
+    local governor="[UNAVAILABLE]"
+    if [[ -f /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor ]]; then
+        governor=$(safe_cmd 5 cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor 2>/dev/null || echo "[UNAVAILABLE]")
+    fi
+    echo "  governor: $governor"
+    
+    # Уязвимости
+    echo ""
+    echo "### CPU_VULNERABILITIES"
+    echo "• DATA:"
+    
+    if [[ -d /sys/devices/system/cpu/vulnerabilities ]]; then
+        for vuln_file in /sys/devices/system/cpu/vulnerabilities/*; do
+            local vuln_name=$(basename "$vuln_file")
+            local vuln_status=$(safe_cmd 5 cat "$vuln_file" 2>/dev/null || echo "[READ_ERROR]")
+            echo "  $vuln_name: $vuln_status"
+            
+            if [[ "$vuln_status" != *"Mitigation"* ]] && [[ "$vuln_status" != "Not affected" ]]; then
+                add_issue "WARNING" "Возможная уязвимость CPU" "$vuln_name" "Проверить обновления микрокода и ядра"
+            fi
+        done
+    else
+        echo "  vulnerabilities_dir: [NOT_FOUND]"
+    fi
+    
+    # Микрокод
+    echo ""
+    echo "### CPU_MICROCODE"
+    echo "• DATA:"
+    
+    local microcode_ver=$(safe_cmd 5 grep "microcode" /proc/cpuinfo 2>/dev/null | head -1 | awk '{print $NF}' || echo "[UNAVAILABLE]")
+    echo "  microcode_version: $microcode_ver"
+    
+    local mce_logs=$(safe_cmd 10 dmesg 2>/dev/null | grep -i "microcode" | tail -5 || echo "")
+    if [[ -n "$mce_logs" ]]; then
+        echo "• RAW_LOGS: [LIMITED: last 5]"
+        echo "$mce_logs" | while read -r line; do echo "  $line"; done
+    fi
+}
+
+scan_cpu_topology() {
+    local level_required=$LEVEL_MEDIUM
+    [[ $SCAN_LEVEL -lt $level_required ]] && return 0
+    
+    echo ""
+    echo "## [CPU_TOPOLOGY]"
+    echo "### TOPOLOGY_DETAILS"
+    
+    echo "• STATUS: OK"
+    echo "• DATA:"
+    
+    if check_tool lscpu; then
+        local sockets=$(safe_cmd 5 lscpu 2>/dev/null | grep "^Socket(s):" | awk '{print $2}' || echo "1")
+        local cores_per_socket=$(safe_cmd 5 lscpu 2>/dev/null | grep "^Core(s) per socket:" | awk '{print $4}' || echo "1")
+        local threads_per_core=$(safe_cmd 5 lscpu 2>/dev/null | grep "^Thread(s) per core:" | awk '{print $4}' || echo "1")
+        
+        echo "  sockets: $sockets"
+        echo "  cores_per_socket: $cores_per_socket"
+        echo "  threads_per_core: $threads_per_core"
+        
+        # Кэш
+        local l1d=$(safe_cmd 5 lscpu 2>/dev/null | grep "^L1d cache:" | awk '{print $3, $4}' || echo "[UNAVAILABLE]")
+        local l1i=$(safe_cmd 5 lscpu 2>/dev/null | grep "^L1i cache:" | awk '{print $3, $4}' || echo "[UNAVAILABLE]")
+        local l2=$(safe_cmd 5 lscpu 2>/dev/null | grep "^L2 cache:" | awk '{print $3, $4}' || echo "[UNAVAILABLE]")
+        local l3=$(safe_cmd 5 lscpu 2>/dev/null | grep "^L3 cache:" | awk '{print $3, $4}' || echo "[UNAVAILABLE]")
+        
+        echo "  l1d_cache: $l1d"
+        echo "  l1i_cache: $l1i"
+        echo "  l2_cache: $l2"
+        echo "  l3_cache: $l3"
+    else
+        echo "[TOOL_MISSING: lscpu]"
+    fi
+    
+    # SMT статус
+    echo ""
+    echo "### SMT_STATUS"
+    echo "• DATA:"
+    
+    if [[ -f /sys/devices/system/cpu/smt/active ]]; then
+        local smt_active=$(safe_cmd 5 cat /sys/devices/system/cpu/smt/active 2>/dev/null || echo "0")
+        if [[ "$smt_active" == "1" ]]; then
+            echo "  smt_enabled: true"
+        else
+            echo "  smt_enabled: false"
+        fi
+    else
+        echo "  smt_status: [UNAVAILABLE]"
+    fi
+}
+
+scan_memory_detailed() {
+    local level_required=$LEVEL_MINIMAL
+    [[ $SCAN_LEVEL -lt $level_required ]] && return 0
+    
+    echo ""
+    echo "## [MEMORY_DETAILED]"
+    echo "### MEMORY_USAGE"
+    
+    echo "• STATUS: OK"
+    echo "• DATA:"
+    
+    if [[ -f /proc/meminfo ]]; then
+        local mem_total=$(safe_cmd 5 grep "^MemTotal:" /proc/meminfo | awk '{print $2}' || echo "0")
+        local mem_free=$(safe_cmd 5 grep "^MemFree:" /proc/meminfo | awk '{print $2}' || echo "0")
+        local mem_available=$(safe_cmd 5 grep "^MemAvailable:" /proc/meminfo | awk '{print $2}' || echo "$mem_free")
+        local mem_buffers=$(safe_cmd 5 grep "^Buffers:" /proc/meminfo | awk '{print $2}' || echo "0")
+        local mem_cached=$(safe_cmd 5 grep "^Cached:" /proc/meminfo | awk '{print $2}' || echo "0")
+        local swap_total=$(safe_cmd 5 grep "^SwapTotal:" /proc/meminfo | awk '{print $2}' || echo "0")
+        local swap_free=$(safe_cmd 5 grep "^SwapFree:" /proc/meminfo | awk '{print $2}' || echo "0")
+        
+        local mem_used=$((mem_total - mem_free - mem_buffers - mem_cached))
+        local mem_percent=$((mem_used * 100 / mem_total))
+        local swap_used=$((swap_total - swap_free))
+        
+        echo "  total_kb: $mem_total"
+        echo "  used_kb: $mem_used"
+        echo "  free_kb: $mem_free"
+        echo "  available_kb: $mem_available"
+        echo "  buffers_kb: $mem_buffers"
+        echo "  cached_kb: $mem_cached"
+        echo "  usage_percent: $mem_percent%"
+        echo "  swap_total_kb: $swap_total"
+        echo "  swap_used_kb: $swap_used"
+        
+        if [[ $mem_percent -gt 90 ]]; then
+            add_issue "CRITICAL" "Использование RAM > 90%" "memory" "Проверить процессы через top/htop, рассмотреть увеличение RAM"
+        elif [[ $mem_percent -gt 80 ]]; then
+            add_issue "WARNING" "Использование RAM > 80%" "memory" "Мониторить использование, проверить утечки памяти"
+        fi
+    else
+        echo "[UNAVAILABLE]"
+    fi
+    
+    # OOM статистика
+    echo ""
+    echo "### OOM_STATISTICS"
+    echo "• DATA:"
+    
+    local oom_kills=$(safe_cmd 5 dmesg 2>/dev/null | grep -c "Out of memory" || echo "0")
+    echo "  oom_kills_count: $oom_kills"
+    
+    if [[ $oom_kills -gt 0 ]]; then
+        add_issue "WARNING" "Зафиксированы OOM kills" "kernel" "Проверить логи dmesg/journalctl, увеличить RAM или swap"
+    fi
+}
+
+scan_storage_detailed() {
+    local level_required=$LEVEL_MINIMAL
+    [[ $SCAN_LEVEL -lt $level_required ]] && return 0
+    
+    echo ""
+    echo "## [STORAGE_DETAILED]"
+    echo "### DISK_USAGE"
+    
+    echo "• STATUS: OK"
+    echo "• DATA:"
+    
+    safe_cmd 10 df -hT 2>/dev/null | tail -n +2 | while read -r filesystem type size used avail use_pct mount; do
+        # Пропускаем pseudo-filesystems
+        [[ "$filesystem" == "tmpfs" ]] && continue
+        [[ "$filesystem" == "devtmpfs" ]] && continue
+        [[ "$filesystem" == "overlay" ]] && continue
+        
+        echo "  device: $filesystem"
+        echo "    type: $type"
+        echo "    size: $size"
+        echo "    used: $used"
+        echo "    available: $avail"
+        echo "    use_percent: $use_pct"
+        echo "    mount: $mount"
+        
+        # Проверка на заполненность
+        local use_num=${use_pct%\%}
+        if [[ $use_num -gt 95 ]]; then
+            add_issue "CRITICAL" "Диск заполнен > 95%" "$mount" "Очистить место или расширить раздел"
+        elif [[ $use_num -gt 85 ]]; then
+            add_issue "WARNING" "Диск заполнен > 85%" "$mount" "Планировать очистку места"
+        fi
+    done
+    
+    # Inodes
+    echo ""
+    echo "### INODE_USAGE"
+    echo "• DATA:"
+    
+    safe_cmd 10 df -i 2>/dev/null | tail -n +2 | while read -r filesystem inodes iused ifree iuse_pct mounted; do
+        [[ "$filesystem" == "tmpfs" ]] && continue
+        local iuse_num=${iuse_pct%\%}
+        if [[ $iuse_num -gt 90 ]]; then
+            echo "  WARNING: $filesystem inode usage: $iuse_pct"
+            add_issue "WARNING" "Высокое использование inodes" "$mounted" "Найти и удалить мелкие файлы"
+        fi
+    done
+    
+    # SMART информация (если доступна)
+    echo ""
+    echo "### SMART_HEALTH"
+    
+    if check_tool smartctl; then
+        local disks=$(safe_cmd 10 lsblk -dpn 2>/dev/null | grep -E "^/dev/(sd|nvme|hd)" | awk '{print $1}')
+        
+        for disk in $disks; do
+            echo ""
+            echo "#### DEVICE: $disk"
+            echo "• DATA:"
+            
+            local smart_status=$(safe_cmd 30 smartctl -H "$disk" 2>/dev/null | grep -i "SMART overall-health" | cut -d: -f2 | xargs || echo "[UNAVAILABLE]")
+            echo "  smart_health: $smart_status"
+            
+            if [[ "$smart_status" != "PASSED" ]] && [[ "$smart_status" != "ok" ]]; then
+                add_issue "CRITICAL" "SMART тест не пройден" "$disk" "Срочно сделать backup и заменить диск"
+                add_prohibition "Форматировать $disk" "SMART ошибки" "Сначала backup + замена диска"
+            fi
+            
+            # Reallocated sectors
+            local reallocated=$(safe_cmd 30 smartctl -A "$disk" 2>/dev/null | grep -i "Reallocated_Sector" | awk '{print $NF}' || echo "0")
+            echo "  reallocated_sectors: $reallocated"
+            
+            if [[ $reallocated -gt 0 ]]; then
+                add_issue "WARNING" "Переназначенные сектора" "$disk" "Мониторить рост, планировать замену"
+                add_prohibition "Игнорировать рост Reallocated_Sector_Ct" "$disk" "Подготовить замену диска"
+            fi
+            
+            # Power-on hours
+            local poh=$(safe_cmd 30 smartctl -A "$disk" 2>/dev/null | grep -i "Power_On_Hours" | awk '{print $NF}' || echo "0")
+            echo "  power_on_hours: $poh"
+        done
+    else
+        echo "[TOOL_MISSING: smartctl]"
+    fi
+}
+
+scan_gpu_detailed() {
+    local level_required=$LEVEL_MEDIUM
+    [[ $SCAN_LEVEL -lt $level_required ]] && return 0
+    
+    echo ""
+    echo "## [GPU_DETAILED]"
+    echo "### GPU_DEVICES"
+    
+    echo "• STATUS: OK"
+    echo "• DATA:"
+    
+    # lspci для GPU
+    local gpu_devices=$(safe_cmd 10 lspci 2>/dev/null | grep -i "VGA\|3D\|Display" || echo "")
+    
+    if [[ -n "$gpu_devices" ]]; then
+        echo "$gpu_devices" | while read -r line; do
+            echo "  pci_device: $line"
+        done
+    else
+        echo "  discrete_gpu: [NOT_FOUND]"
+    fi
+    
+    # NVIDIA (если есть)
+    if check_tool nvidia-smi; then
+        echo ""
+        echo "### NVIDIA_GPU"
+        echo "• DATA:"
+        
+        local nvidia_status=$(safe_cmd 15 nvidia-smi -q 2>/dev/null | head -50 || echo "[UNAVAILABLE]")
+        if [[ -n "$nvidia_status" ]]; then
+            echo "• RAW_LOGS: [TRUNCATED: first 50 lines]"
+            echo "$nvidia_status" | head -20 | while read -r line; do echo "  $line"; done
+        fi
+    else
+        echo "  nvidia_driver: [NOT_INSTALLED]"
+    fi
+    
+    # Intel GPU
+    if check_tool intel_gpu_top; then
+        echo ""
+        echo "### INTEL_GPU"
+        echo "• DATA:"
+        echo "  intel_gpu_tools: installed"
+    fi
+}
+
+scan_battery_power() {
+    local level_required=$LEVEL_MINIMAL
+    [[ $SCAN_LEVEL -lt $level_required ]] && return 0
+    
+    echo ""
+    echo "## [BATTERY_POWER]"
+    echo "### BATTERY_STATUS"
+    
+    echo "• STATUS: OK"
+    echo "• DATA:"
+    
+    if [[ -d /sys/class/power_supply ]]; then
+        local batteries=$(ls -d /sys/class/power_supply/BAT* 2>/dev/null || echo "")
+        
+        if [[ -n "$batteries" ]]; then
+            for bat in $batteries; do
+                local bat_name=$(basename "$bat")
+                echo "  battery: $bat_name"
+                
+                local capacity=$(safe_cmd 5 cat "$bat/capacity" 2>/dev/null || echo "[UNAVAILABLE]")
+                local status=$(safe_cmd 5 cat "$bat/status" 2>/dev/null || echo "[UNAVAILABLE]")
+                local energy_full=$(safe_cmd 5 cat "$bat/energy_full" 2>/dev/null || safe_cmd 5 cat "$bat/charge_full" 2>/dev/null || echo "[UNAVAILABLE]")
+                local energy_now=$(safe_cmd 5 cat "$bat/energy_now" 2>/dev/null || safe_cmd 5 cat "$bat/charge_now" 2>/dev/null || echo "[UNAVAILABLE]")
+                
+                echo "    capacity_percent: $capacity%"
+                echo "    status: $status"
+                echo "    energy_full: $energy_full"
+                echo "    energy_now: $energy_now"
+                
+                if [[ $capacity -lt 50 ]]; then
+                    add_issue "WARNING" "Износ батареи > 50%" "$bat_name" "Рассмотреть замену батареи"
+                fi
+            done
+        else
+            echo "  battery: [NO_BATTERY_DETECTED] (desktop or unavailable)"
+        fi
+    else
+        echo "[UNAVAILABLE]"
+    fi
+    
+    # AC адаптер
+    echo ""
+    echo "### AC_ADAPTER"
+    echo "• DATA:"
+    
+    local ac_adapters=$(ls -d /sys/class/power_supply/AC* 2>/dev/null || echo "")
+    if [[ -n "$ac_adapters" ]]; then
+        for ac in $ac_adapters; do
+            local ac_status=$(safe_cmd 5 cat "$ac/online" 2>/dev/null || echo "[UNAVAILABLE]")
+            echo "  adapter: $(basename $ac)"
+            echo "    online: $ac_status"
+        done
+    else
+        echo "  ac_adapter: [NOT_FOUND]"
+    fi
+}
+
+scan_thermal_cooling() {
+    local level_required=$LEVEL_MEDIUM
+    [[ $SCAN_LEVEL -lt $level_required ]] && return 0
+    
+    echo ""
+    echo "## [THERMAL_COOLING]"
+    echo "### TEMPERATURES"
+    
+    echo "• STATUS: OK"
+    echo "• DATA:"
+    
+    if check_tool sensors; then
+        local sensors_output=$(safe_cmd 15 sensors 2>/dev/null || echo "")
+        if [[ -n "$sensors_output" ]]; then
+            echo "• RAW_LOGS: [TRUNCATED]"
+            echo "$sensors_output" | head -30 | while read -r line; do
+                [[ -n "$line" ]] && echo "  $line"
+            done
+            
+            # Проверка на перегрев
+            local high_temp=$(echo "$sensors_output" | grep -E "Package id 0|Core|Tdie" | grep -oE '[0-9]+\.[0-9]+' | sort -rn | head -1 || echo "0")
+            if [[ -n "$high_temp" ]]; then
+                local temp_int=${high_temp%.*}
+                if [[ $temp_int -gt 90 ]]; then
+                    add_issue "CRITICAL" "Критическая температура CPU > 90°C" "thermal" "Проверить систему охлаждения, заменить термопасту"
+                elif [[ $temp_int -gt 80 ]]; then
+                    add_issue "WARNING" "Высокая температура CPU > 80°C" "thermal" "Проверить вентиляцию и нагрузку"
+                fi
+            fi
+        else
+            echo "  sensors: [NO_DATA]"
+        fi
+    else
+        echo "[TOOL_MISSING: sensors]"
+    fi
+    
+    # Тепловые зоны
+    echo ""
+    echo "### THERMAL_ZONES"
+    echo "• DATA:"
+    
+    if [[ -d /sys/class/thermal ]]; then
+        for zone in /sys/class/thermal/thermal_zone*; do
+            local zone_type=$(safe_cmd 5 cat "$zone/type" 2>/dev/null || echo "unknown")
+            local zone_temp=$(safe_cmd 5 cat "$zone/temp" 2>/dev/null || echo "0")
+            local temp_c=$((zone_temp / 1000))
+            echo "  zone: $zone_type"
+            echo "    temperature_c: $temp_c"
+        done
+    fi
+}
+
+scan_network_detailed() {
+    local level_required=$LEVEL_MEDIUM
+    [[ $SCAN_LEVEL -lt $level_required ]] && return 0
+    
+    echo ""
+    echo "## [NETWORK_DETAILED]"
+    echo "### INTERFACES"
+    
+    echo "• STATUS: OK"
+    echo "• DATA:"
+    
+    # Основные интерфейсы
+    safe_cmd 10 ip -br addr 2>/dev/null | while read -r iface state mac_addr; do
+        echo "  interface: $iface"
+        echo "    state: $state"
+        echo "    mac: $mac_addr"
+        
+        # Статистика
+        if [[ -f "/sys/class/net/$iface/statistics/rx_bytes" ]]; then
+            local rx_bytes=$(safe_cmd 5 cat "/sys/class/net/$iface/statistics/rx_bytes" 2>/dev/null || echo "0")
+            local tx_bytes=$(safe_cmd 5 cat "/sys/class/net/$iface/statistics/tx_bytes" 2>/dev/null || echo "0")
+            local rx_errors=$(safe_cmd 5 cat "/sys/class/net/$iface/statistics/rx_errors" 2>/dev/null || echo "0")
+            local tx_errors=$(safe_cmd 5 cat "/sys/class/net/$iface/statistics/tx_errors" 2>/dev/null || echo "0")
+            
+            echo "    rx_bytes: $rx_bytes"
+            echo "    tx_bytes: $tx_bytes"
+            echo "    rx_errors: $rx_errors"
+            echo "    tx_errors: $tx_errors"
+            
+            if [[ $rx_errors -gt 100 ]] || [[ $tx_errors -gt 100 ]]; then
+                add_issue "WARNING" "Ошибки сети на интерфейсе" "$iface" "Проверить кабель, драйвер, настройки"
+            fi
+        fi
+    done
+    
+    # Маршруты
+    echo ""
+    echo "### ROUTING_TABLE"
+    echo "• DATA:"
+    
+    safe_cmd 10 ip route 2>/dev/null | head -10 | while read -r line; do
+        echo "  route: $line"
+    done
+    
+    # DNS
+    echo ""
+    echo "### DNS_CONFIG"
+    echo "• DATA:"
+    
+    if [[ -f /etc/resolv.conf ]]; then
+        safe_cmd 5 grep "^nameserver" /etc/resolv.conf 2>/dev/null | while read -r line; do
+            echo "  nameserver: $line"
+        done
+    fi
+    
+    # Открытые порты
+    echo ""
+    echo "### OPEN_PORTS"
+    echo "• DATA:"
+    
+    if check_tool ss; then
+        local listening_ports=$(safe_cmd 10 ss -tulpn 2>/dev/null | tail -n +2 || echo "")
+        if [[ -n "$listening_ports" ]]; then
+            echo "• RAW_LOGS: [TRUNCATED: first 30]"
+            echo "$listening_ports" | head -30 | while read -r line; do echo "  $line"; done
+        fi
+    else
+        echo "[TOOL_MISSING: ss]"
+    fi
+}
+
+scan_audio_subsystem() {
+    local level_required=$LEVEL_MEDIUM
+    [[ $SCAN_LEVEL -lt $level_required ]] && return 0
+    
+    echo ""
+    echo "## [AUDIO_SUBSYSTEM]"
+    echo "### ALSA_DEVICES"
+    
+    echo "• STATUS: OK"
+    echo "• DATA:"
+    
+    if [[ -f /proc/asound/cards ]]; then
+        local alsa_cards=$(safe_cmd 5 cat /proc/asound/cards 2>/dev/null || echo "")
+        if [[ -n "$alsa_cards" ]]; then
+            echo "• RAW_LOGS:"
+            echo "$alsa_cards" | while read -r line; do
+                [[ -n "$line" ]] && echo "  $line"
+            done
+        else
+            echo "  alsa_cards: [NONE]"
+        fi
+    fi
+    
+    # PulseAudio/PipeWire
+    echo ""
+    echo "### AUDIO_SERVER"
+    echo "• DATA:"
+    
+    if check_tool pactl; then
+        local pulse_status=$(safe_cmd 10 pactl info 2>/dev/null | grep "Server Name" || echo "[UNAVAILABLE]")
+        echo "  audio_server: $pulse_status"
+    elif check_tool pw-cli; then
+        echo "  audio_server: PipeWire"
+    else
+        echo "  audio_server: [NOT_DETECTED]"
+    fi
+}
+
+scan_hardware_errors() {
+    local level_required=$LEVEL_TOTAL
+    [[ $SCAN_LEVEL -lt $level_required ]] && return 0
+    
+    echo ""
+    echo "## [HARDWARE_ERRORS]"
+    echo "### MCE_ERRORS"
+    
+    echo "• STATUS: OK"
+    echo "• DATA:"
+    
+    local mce_count=$(safe_cmd 10 dmesg 2>/dev/null | grep -c -i "MCE\|Machine Check" || echo "0")
+    echo "  mce_events: $mce_count"
+    
+    if [[ $mce_count -gt 0 ]]; then
+        add_issue "CRITICAL" "Обнаружены MCE ошибки" "cpu/hardware" "Проверить стабильность CPU, RAM, питание"
+        add_prohibition "Игнорировать MCE ошибки" "hardware" "Срочная диагностика оборудования"
+    fi
+    
+    # PCIe AER ошибки
+    echo ""
+    echo "### PCIE_AER_ERRORS"
+    echo "• DATA:"
+    
+    local aer_errors=$(safe_cmd 10 dmesg 2>/dev/null | grep -c -i "AER\|PCIe.*error" || echo "0")
+    echo "  aer_error_count: $aer_errors"
+    
+    if [[ $aer_errors -gt 0 ]]; then
+        add_issue "WARNING" "Ошибки PCIe AER" "pci_bus" "Проверить устройства PCIe, обновить прошивки"
+    fi
+    
+    # USB ошибки
+    echo ""
+    echo "### USB_ERRORS"
+    echo "• DATA:"
+    
+    local usb_errors=$(safe_cmd 10 dmesg 2>/dev/null | grep -c -i "usb.*reset\|usb.*error" || echo "0")
+    echo "  usb_reset_error_count: $usb_errors"
+    
+    if [[ $usb_errors -gt 10 ]]; then
+        add_issue "WARNING" "Частые сбросы USB" "usb_subsystem" "Проверить USB устройства и кабели"
+    fi
+}
+
+scan_logs_analysis() {
+    local level_required=$LEVEL_MEDIUM
+    [[ $SCAN_LEVEL -lt $level_required ]] && return 0
+    
+    echo ""
+    echo "## [LOGS_ANALYSIS]"
+    echo "### JOURNALCTL_ERRORS"
+    
+    echo "• STATUS: OK"
+    echo "• DATA:"
+    
+    # Критические сообщения из journalctl
+    local journal_errors=$(safe_cmd 30 journalctl -p err -xb --no-pager 2>/dev/null | tail -50 || echo "")
+    
+    if [[ -n "$journal_errors" ]]; then
+        local error_count=$(echo "$journal_errors" | wc -l)
+        echo "  error_count_current_boot: $error_count"
+        
+        # Поиск паттернов
+        local segfault_count=$(echo "$journal_errors" | grep -c "segfault" || echo "0")
+        local oom_count=$(echo "$journal_errors" | grep -c -i "out of memory" || echo "0")
+        local io_error_count=$(echo "$journal_errors" | grep -c -i "I/O error" || echo "0")
+        
+        echo "  segfault_events: $segfault_count"
+        echo "  oom_events: $oom_count"
+        echo "  io_error_events: $io_error_count"
+        
+        if [[ $segfault_count -gt 5 ]]; then
+            add_issue "WARNING" "Множественные segfault" "applications" "Проверить стабильность приложений"
+        fi
+        
+        if [[ $io_error_count -gt 0 ]]; then
+            add_issue "CRITICAL" "Ошибки ввода-вывода в логах" "storage" "Проверить диски на SMART, кабели SATA"
+        fi
+        
+        echo ""
+        echo "• RAW_LOGS: [TRUNCATED: last 20 errors]"
+        echo "$journal_errors" | tail -20 | while read -r line; do
+            [[ -n "$line" ]] && echo "  $line"
+        done
+    else
+        echo "  critical_errors: [NONE_FOUND]"
+    fi
+    
+    # Dmesg предупреждения
+    echo ""
+    echo "### DMESG_WARNINGS"
+    echo "• DATA:"
+    
+    local dmesg_warn=$(safe_cmd 10 dmesg -l err,warn 2>/dev/null | tail -30 || echo "")
+    if [[ -n "$dmesg_warn" ]]; then
+        local warn_count=$(echo "$dmesg_warn" | wc -l)
+        echo "  warning_count: $warn_count"
+        echo "• RAW_LOGS: [TRUNCATED: last 15]"
+        echo "$dmesg_warn" | tail -15 | while read -r line; do echo "  $line"; done
+    else
+        echo "  kernel_warnings: [NONE]"
+    fi
+}
+
+scan_config_validation() {
+    local level_required=$LEVEL_TOTAL
+    [[ $SCAN_LEVEL -lt $level_required ]] && return 0
+    
+    echo ""
+    echo "## [CONFIG_VALIDATION]"
+    echo "### FSTAB_CHECK"
+    
+    echo "• STATUS: OK"
+    echo "• DATA:"
+    
+    if [[ -f /etc/fstab ]]; then
+        local fstab_lines=$(safe_cmd 5 wc -l < /etc/fstab || echo "0")
+        echo "  fstab_entries: $fstab_lines"
+        
+        # Проверка синтаксиса (findmnt)
+        if check_tool findmnt; then
+            local fstab_verify=$(safe_cmd 10 findmnt --verify 2>&1 || echo "")
+            if [[ -n "$fstab_verify" ]] && [[ "$fstab_verify" != *"verified"* ]]; then
+                echo "  fstab_verification: FAILED"
+                echo "• RAW_LOGS:"
+                echo "$fstab_verify" | while read -r line; do echo "  $line"; done
+                add_issue "WARNING" "Ошибки в /etc/fstab" "/etc/fstab" "Исправить некорректные записи"
+            else
+                echo "  fstab_verification: PASSED"
+            fi
+        fi
+    else
+        echo "  fstab: [NOT_FOUND]"
+    fi
+    
+    # SSH конфиг
+    echo ""
+    echo "### SSHD_CONFIG"
+    echo "• DATA:"
+    
+    if [[ -f /etc/ssh/sshd_config ]]; then
+        if check_tool sshd; then
+            local sshd_test=$(safe_cmd 10 sshd -t 2>&1 || echo "")
+            if [[ -n "$sshd_test" ]]; then
+                echo "  sshd_syntax_check: FAILED"
+                echo "• RAW_LOGS:"
+                echo "$sshd_test" | while read -r line; do echo "  $line"; done
+                add_issue "WARNING" "Ошибки в конфигурации SSH" "/etc/ssh/sshd_config" "Исправить синтаксис sshd_config"
+            else
+                echo "  sshd_syntax_check: PASSED"
+            fi
+        else
+            echo "  sshd_binary: [NOT_FOUND]"
+        fi
+    else
+        echo "  sshd_config: [NOT_FOUND]"
+    fi
+    
+    # Systemd units
+    echo ""
+    echo "### SYSTEMD_UNITS"
+    echo "• DATA:"
+    
+    local failed_units=$(safe_cmd 10 systemctl --failed --no-pager 2>/dev/null | tail -n +2 || echo "")
+    if [[ -n "$failed_units" ]]; then
+        local failed_count=$(echo "$failed_units" | wc -l)
+        echo "  failed_units_count: $failed_count"
+        echo "• RAW_LOGS:"
+        echo "$failed_units" | while read -r line; do echo "  $line"; done
+        add_issue "WARNING" "Есть упавшие systemd службы" "systemd" "Проверить статус через systemctl status <unit>"
+    else
+        echo "  failed_units: [NONE]"
+    fi
+}
+
+scan_package_management() {
+    local level_required=$LEVEL_MEDIUM
+    [[ $SCAN_LEVEL -lt $level_required ]] && return 0
+    
+    echo ""
+    echo "## [PACKAGE_MANAGEMENT]"
+    echo "### PACKAGE_MANAGER"
+    
+    detect_package_manager
+    echo "• STATUS: OK"
+    echo "• DATA:"
+    echo "  detected_manager: $PKG_MGR"
+    
+    case "$PKG_MGR" in
+        apt)
+            echo ""
+            echo "### APT_STATUS"
+            echo "• DATA:"
+            
+            # Обновления
+            local updates_avail=$(safe_cmd 30 apt list --upgradable 2>/dev/null | tail -n +2 | wc -l || echo "0")
+            echo "  available_updates: $updates_avail"
+            
+            # Битые пакеты
+            local broken=$(safe_cmd 10 dpkg --audit 2>/dev/null | wc -l || echo "0")
+            echo "  broken_packages: $broken"
+            
+            if [[ $broken -gt 0 ]]; then
+                add_issue "WARNING" "Битые пакеты в dpkg" "apt" "Выполнить sudo apt --fix-broken install"
+            fi
+            
+            # Автоудаление
+            local autoremove=$(safe_cmd 10 apt autoremove --dry-run 2>/dev/null | grep "^Remv" | wc -l || echo "0")
+            echo "  autoremove_candidates: $autoremove"
+            ;;
+            
+        dnf|yum)
+            echo ""
+            echo "### DNF_STATUS"
+            echo "• DATA:"
+            
+            local updates_avail=$(safe_cmd 30 dnf check-update 2>/dev/null | tail -n +2 | wc -l || echo "0")
+            echo "  available_updates: $updates_avail"
+            
+            local broken=$(safe_cmd 10 dnf verify 2>/dev/null | grep -c "FAILED" || echo "0")
+            echo "  verification_failures: $broken"
+            ;;
+            
+        pacman)
+            echo ""
+            echo "### PACMAN_STATUS"
+            echo "• DATA:"
+            
+            local updates_avail=$(safe_cmd 30 pacman -Qu 2>/dev/null | wc -l || echo "0")
+            echo "  available_updates: $updates_avail"
+            
+            # Orphaned пакеты
+            local orphaned=$(safe_cmd 10 pacman -Qdtq 2>/dev/null | wc -l || echo "0")
+            echo "  orphaned_packages: $orphaned"
+            ;;
+            
+        zypper)
+            echo ""
+            echo "### ZYPPER_STATUS"
+            echo "• DATA:"
+            
+            local updates_avail=$(safe_cmd 30 zypper list-updates 2>/dev/null | tail -n +2 | wc -l || echo "0")
+            echo "  available_updates: $updates_avail"
+            ;;
+            
+        *)
+            echo "  package_management: [UNKNOWN_MANAGER]"
+            ;;
+    esac
+}
+
+scan_containers_virt() {
+    local level_required=$LEVEL_TOTAL
+    [[ $SCAN_LEVEL -lt $level_required ]] && return 0
+    
+    echo ""
+    echo "## [CONTAINERS_VIRTUALIZATION]"
+    echo "### VIRTUALIZATION_DETECT"
+    
+    echo "• STATUS: OK"
+    echo "• DATA:"
+    
+    local virt_type=$(safe_cmd 10 systemd-detect-virt 2>/dev/null || echo "none")
+    echo "  virtualization: $virt_type"
+    
+    # Docker
+    echo ""
+    echo "### DOCKER_STATUS"
+    echo "• DATA:"
+    
+    if check_tool docker; then
+        local docker_running=$(safe_cmd 10 systemctl is-active docker 2>/dev/null || echo "inactive")
+        echo "  docker_service: $docker_running"
+        
+        if [[ "$docker_running" == "active" ]]; then
+            local containers=$(safe_cmd 15 docker ps -a 2>/dev/null | tail -n +2 | wc -l || echo "0")
+            local images=$(safe_cmd 15 docker images 2>/dev/null | tail -n +2 | wc -l || echo "0")
+            echo "  containers_count: $containers"
+            echo "  images_count: $images"
+        fi
+    else
+        echo "  docker: [NOT_INSTALLED]"
+    fi
+    
+    # Podman
+    echo ""
+    echo "### PODMAN_STATUS"
+    echo "• DATA:"
+    
+    if check_tool podman; then
+        echo "  podman: installed"
+        local podman_containers=$(safe_cmd 15 podman ps -a 2>/dev/null | tail -n +2 | wc -l || echo "0")
+        echo "  containers_count: $podman_containers"
+    else
+        echo "  podman: [NOT_INSTALLED]"
+    fi
+    
+    # KVM/libvirt
+    echo ""
+    echo "### KVM_LIBVIRT"
+    echo "• DATA:"
+    
+    if check_tool virsh; then
+        local libvirtd=$(safe_cmd 10 systemctl is-active libvirtd 2>/dev/null || echo "inactive")
+        echo "  libvirtd_service: $libvirtd"
+        
+        if [[ "$libvirtd" == "active" ]]; then
+            local vms=$(safe_cmd 15 virsh list --all 2>/dev/null | tail -n +3 | wc -l || echo "0")
+            echo "  vms_count: $vms"
+        fi
+    else
+        echo "  libvirt: [NOT_INSTALLED]"
+    fi
+}
+
+scan_security_hardening() {
+    local level_required=$LEVEL_TOTAL
+    [[ $SCAN_LEVEL -lt $level_required ]] && return 0
+    
+    echo ""
+    echo "## [SECURITY_HARDENING]"
+    echo "### FIREWALL_STATUS"
+    
+    echo "• STATUS: OK"
+    echo "• DATA:"
+    
+    # UFW
+    if check_tool ufw; then
+        local ufw_status=$(safe_cmd 10 ufw status 2>/dev/null | head -1 || echo "inactive")
+        echo "  ufw: $ufw_status"
+    fi
+    
+    # iptables
+    local ipt_rules=$(safe_cmd 10 iptables -L -n 2>/dev/null | wc -l || echo "0")
+    echo "  iptables_rules: $ipt_rules"
+    
+    # SELinux/AppArmor
+    echo ""
+    echo "### MAC_SYSTEM"
+    echo "• DATA:"
+    
+    if check_tool getenforce; then
+        local selinux=$(safe_cmd 5 getenforce 2>/dev/null || echo "disabled")
+        echo "  selinux: $selinux"
+    fi
+    
+    if check_tool aa-status; then
+        local apparmor=$(safe_cmd 10 aa-status 2>/dev/null | head -1 || echo "[UNAVAILABLE]")
+        echo "  apparmor: $apparmor"
+    fi
+    
+    # SUID/SGID файлы
+    echo ""
+    echo "### SUID_SGID_FILES"
+    echo "• DATA:"
+    
+    local suid_files=$(safe_cmd 60 find /usr /bin /sbin -perm -4000 2>/dev/null | head -20 || echo "")
+    if [[ -n "$suid_files" ]]; then
+        local suid_count=$(echo "$suid_files" | wc -l)
+        echo "  suid_files_found: $suid_count"
+        echo "• RAW_LOGS: [TRUNCATED: first 20]"
+        echo "$suid_files" | while read -r file; do echo "  $file"; done
+    fi
+    
+    # SSH безопасность
+    echo ""
+    echo "### SSH_SECURITY"
+    echo "• DATA:"
+    
+    if [[ -f /etc/ssh/sshd_config ]]; then
+        local root_login=$(safe_cmd 5 grep -i "^PermitRootLogin" /etc/ssh/sshd_config 2>/dev/null | awk '{print $2}' || "not_set")
+        local pass_auth=$(safe_cmd 5 grep -i "^PasswordAuthentication" /etc/ssh/sshd_config 2>/dev/null | awk '{print $2}' || "not_set")
+        
+        echo "  permit_root_login: $root_login"
+        echo "  password_authentication: $pass_auth"
+        
+        if [[ "$root_login" == "yes" ]]; then
+            add_issue "WARNING" "Разрешён root login по SSH" "security" "Установить PermitRootLogin no"
+        fi
+    fi
+}
+
+scan_performance_metrics() {
+    local level_required=$LEVEL_PROFILING
+    [[ $SCAN_LEVEL -lt $level_required ]] && return 0
+    
+    echo ""
+    echo "## [PERFORMANCE_METRICS]"
+    echo "### LOAD_AVERAGE"
+    
+    echo "• STATUS: OK"
+    echo "• DATA:"
+    
+    local load_avg=$(safe_cmd 5 cat /proc/loadavg 2>/dev/null || echo "0 0 0 0 0")
+    local load_1=$(echo "$load_avg" | awk '{print $1}')
+    local load_5=$(echo "$load_avg" | awk '{print $2}')
+    local load_15=$(echo "$load_avg" | awk '{print $3}')
+    
+    echo "  load_1min: $load_1"
+    echo "  load_5min: $load_5"
+    echo "  load_15min: $load_15"
+    
+    # Проверка на высокую нагрузку
+    local cpu_count=$(safe_cmd 5 nproc 2>/dev/null || echo "1")
+    local load_int=${load_1%.*}
+    if [[ $load_int -gt $((cpu_count * 2)) ]]; then
+        add_issue "CRITICAL" "Очень высокая нагрузка CPU" "performance" "Найти процесс через top, проверить троттлинг"
+    fi
+    
+    # Топ процессов
+    echo ""
+    echo "### TOP_PROCESSES_CPU"
+    echo "• DATA:"
+    
+    safe_cmd 10 ps aux --sort=-%cpu 2>/dev/null | head -11 | tail -10 | while read -r user pid cpu mem vsz rss tty stat start time cmd; do
+        echo "  pid: $pid | cpu: $cpu% | mem: $mem% | cmd: $cmd"
+    done
+    
+    echo ""
+    echo "### TOP_PROCESSES_MEM"
+    echo "• DATA:"
+    
+    safe_cmd 10 ps aux --sort=-%mem 2>/dev/null | head -11 | tail -10 | while read -r user pid cpu mem vsz rss tty stat start time cmd; do
+        echo "  pid: $pid | cpu: $cpu% | mem: $mem% | cmd: $cmd"
+    done
+    
+    # I/O статистика
+    echo ""
+    echo "### IO_STATS"
+    echo "• DATA:"
+    
+    if check_tool iostat; then
+        local iostat_out=$(safe_cmd 10 iostat -x 2>/dev/null | tail -20 || echo "")
+        if [[ -n "$iostat_out" ]]; then
+            echo "• RAW_LOGS:"
+            echo "$iostat_out" | while read -r line; do [[ -n "$line" ]] && echo "  $line"; done
+        fi
+    else
+        echo "[TOOL_MISSING: iostat]"
+    fi
+}
+
+scan_strict_prohibitions() {
+    echo ""
+    echo "## [STRICT_PROHIBITIONS]"
+    
+    # Универсальные запреты
+    add_prohibition "Менять права на /etc, /usr, /lib рекурсивно" "Риск поломки системы" "Использовать точечные изменения с бэкапом"
+    add_prohibition "Отключать systemd-resolved/NetworkManager/sshd без fallback" "Потеря доступа к системе" "Сначала настроить альтернативный метод доступа"
+    add_prohibition "Удалять dkms-модули или /lib/modules/\$(uname -r) без проверки" "Система не загрузится" "Использовать autoremove и проверить зависимости"
+    add_prohibition "Запускать fsck на смонтированном корне" "Потеря данных" "Загрузиться с LiveUSB, сделать backup"
+    add_prohibition "Игнорировать пометки [CRITICAL], [NEEDS_ROOT] из отчёта" "Риск усугубления проблем" "Сначала проанализировать, потом действовать"
+    add_prohibition "Применять быстрые фиксы из интернета без понимания" "Непредсказуемые последствия" "Проверить в тестовой среде, иметь план отката"
+    
+    # Вывод всех запретов
+    for prohibition in "${STRICT_PROHIBITIONS[@]}"; do
+        echo "$prohibition"
+    done
+}
+
+generate_ai_summary() {
+    echo ""
+    echo "## [AI_SUMMARY_READY]"
+    
+    # Критические проблемы
+    echo "CRITICAL_ISSUES"
+    if [[ ${#CRITICAL_ISSUES[@]} -eq 0 ]]; then
+        echo "[NONE]"
+    else
+        for issue in "${CRITICAL_ISSUES[@]}"; do
+            echo "$issue"
+        done
+    fi
+    
+    # Предупреждения
+    echo ""
+    echo "WARNING_ISSUES"
+    if [[ ${#WARNING_ISSUES[@]} -eq 0 ]]; then
+        echo "[NONE]"
+    else
+        for issue in "${WARNING_ISSUES[@]}"; do
+            echo "$issue"
+        done
+    fi
+    
+    # Информация
+    echo ""
+    echo "INFO_ISSUES"
+    if [[ ${#INFO_ISSUES[@]} -eq 0 ]]; then
+        echo "[NONE]"
+    else
+        for issue in "${INFO_ISSUES[@]}"; do
+            echo "$issue"
+        done
+    fi
+    
+    # Запреты
+    echo ""
+    scan_strict_prohibitions
+    
+    # Следующие шаги
+    echo ""
+    echo "[NEXT_STEPS_FOR_AI_ANALYSIS]"
+    echo "• Передай этот отчёт ИИ с запросом: Проанализируй, дай пошаговый план устранения, выдели риски."
+    echo "• Не выполняй команды с пометкой [NEEDS_ROOT] без аудита и понимания последствий."
+    echo "• Все рекомендации проверяй на idempotency и безопасность отката."
+    
+    # Если проблем нет
+    if [[ ${#CRITICAL_ISSUES[@]} -eq 0 ]] && [[ ${#WARNING_ISSUES[@]} -eq 0 ]]; then
+        echo ""
+        echo "✅ SYSTEM_HEALTHY: No critical issues detected."
+        echo "[INFO] Все проверенные параметры в пределах нормы | система | продолжай мониторинг"
+    fi
+}
+
+#-------------------------------------------------------------------------------
+# ОПРЕДЕЛЕНИЕ ПУТИ СОХРАНЕНИЯ ОТЧЁТА
+#-------------------------------------------------------------------------------
+determine_output_path() {
+    # Приоритетные директории
+    local dirs_to_try=(
+        "$HOME/Desktop"
+        "$HOME/Рабочий_стол"
+        "$HOME"
+    )
+    
+    for dir in "${dirs_to_try[@]}"; do
+        if [[ -d "$dir" ]]; then
+            TARGET_DIR="$dir"
+            break
+        fi
+    done
+    
+    # Если ни одна не существует, пробуем создать Desktop
+    if [[ -z "$TARGET_DIR" ]]; then
+        TARGET_DIR="$HOME/Desktop"
+        if ! mkdir -p "$TARGET_DIR" 2>/dev/null; then
+            echo -e "${COLOR_YELLOW}⚠️ Не удалось создать $TARGET_DIR, использую $HOME${COLOR_RESET}"
+            TARGET_DIR="$HOME"
+        fi
+    fi
+    
+    OUTPUT_FILE="$TARGET_DIR/$OUTPUT_FILENAME"
+}
+
+#-------------------------------------------------------------------------------
+# МЕНЮ ВЫБОРА УРОВНЯ СКАНИРОВАНИЯ
+#-------------------------------------------------------------------------------
+show_menu() {
+    echo ""
+    echo "═══════════════════════════════════════════════════════════"
+    echo "  🔍 DEEP SYSTEM SCAN v${SCRIPT_VERSION} - Диагностика системы"
+    echo "═══════════════════════════════════════════════════════════"
+    echo ""
+    echo "Выберите уровень сканирования:"
+    echo ""
+    echo "  [1] 🟢 МИНИМАЛЬНЫЙ: ядро, CPU/RAM базово, uptime, свободное место"
+    echo "  [2] 🟡 СРЕДНИЙ: всё из [1] + systemd, пакеты, сеть, SMART, пользователи"
+    echo "  [3] 🔴 ТОТАЛЬНЫЙ: всё из [2] + безопасность, валидация, контейнеры"
+    echo "  [4] ⚡ ПРОФИЛИРОВАНИЕ: всё из [3] + perf/eBPF метрики (требуется подтверждение)"
+    echo ""
+    echo -n "Ваш выбор [1-4]: "
+}
+
+get_scan_level() {
+    # Проверка аргументов командной строки
+    for arg in "$@"; do
+        case "$arg" in
+            --level=*)
+                SCAN_LEVEL="${arg#*=}"
+                return
+                ;;
+            --auto-install)
+                AUTO_INSTALL=true
+                ;;
+            --force-profiling)
+                FORCE_PROFILING=true
+                SCAN_LEVEL=$LEVEL_PROFILING
+                return
+                ;;
+            --help|-h)
+                echo "Использование: $0 [OPTIONS]"
+                echo ""
+                echo "OPTIONS:"
+                echo "  --level=N          Уровень сканирования (1-4)"
+                echo "  --auto-install     Автоматически установить недостающие утилиты"
+                echo "  --force-profiling  Режим профилирования без подтверждения"
+                echo "  --help, -h         Показать эту справку"
+                exit 0
+                ;;
+        esac
+    done
+    
+    # Если уровень не задан аргументом, показываем меню
+    if [[ $SCAN_LEVEL -eq 0 ]]; then
+        show_menu
+        read -r choice
+        
+        case "$choice" in
+            1) SCAN_LEVEL=$LEVEL_MINIMAL ;;
+            2) SCAN_LEVEL=$LEVEL_MEDIUM ;;
+            3) SCAN_LEVEL=$LEVEL_TOTAL ;;
+            4)
+                echo ""
+                echo -e "${COLOR_RED}⚠️ ВНИМАНИЕ: Режим профилирования может создавать нагрузку на систему!${COLOR_RESET}"
+                echo "Этот режим включает стресс-тесты и расширенные метрики производительности."
+                echo ""
+                read -p "Вы уверены, что хотите продолжить? [y/N]: " confirm
+                if [[ "$confirm" =~ ^[Yy]$ ]]; then
+                    SCAN_LEVEL=$LEVEL_PROFILING
+                else
+                    echo "Возврат к выбору уровня..."
+                    get_scan_level
+                    return
+                fi
+                ;;
+            *)
+                echo -e "${COLOR_RED}❌ Неверный выбор. По умолчанию установлен уровень 2 (Средний).${COLOR_RESET}"
+                SCAN_LEVEL=$LEVEL_MEDIUM
+                ;;
+        esac
+    fi
+}
+
+#-------------------------------------------------------------------------------
+# ОСНОВНАЯ ФУНКЦИЯ СКАНИРОВАНИЯ
+#-------------------------------------------------------------------------------
+run_scan() {
+    echo ""
+    echo "═══════════════════════════════════════════════════════════"
+    echo "  🚀 Начало сканирования (уровень: $SCAN_LEVEL)"
+    echo "═══════════════════════════════════════════════════════════"
+    echo ""
+    
+    local step=0
+    local total_steps=21
+    
+    # Helper для вывода прогресса
+    print_progress() {
+        local msg="$1"
+        local status="$2"
+        ((step++))
+        printf "[%d/%d] %-50s [%s]\n" "$step" "$total_steps" "$msg" "$status"
+    }
+    
+    # === MINIMAL LEVEL ===
+    print_progress "Базовая информация о системе" "RUNNING"
+    scan_basic_info
+    print_progress "Базовая информация о системе" "OK"
+    
+    print_progress "Детальная диагностика CPU" "RUNNING"
+    scan_cpu_detailed
+    print_progress "Детальная диагностика CPU" "OK"
+    
+    print_progress "Топология CPU" "RUNNING"
+    scan_cpu_topology
+    print_progress "Топология CPU" "OK"
+    
+    print_progress "Детальная диагностика RAM" "RUNNING"
+    scan_memory_detailed
+    print_progress "Детальная диагностика RAM" "OK"
+    
+    print_progress "Диски и файловые системы" "RUNNING"
+    scan_storage_detailed
+    print_progress "Диски и файловые системы" "OK"
+    
+    print_progress "Батарея и питание" "RUNNING"
+    scan_battery_power
+    print_progress "Батарея и питание" "OK"
+    
+    # === MEDIUM LEVEL ===
+    if [[ $SCAN_LEVEL -ge $LEVEL_MEDIUM ]]; then
+        print_progress "GPU и графика" "RUNNING"
+        scan_gpu_detailed
+        print_progress "GPU и графика" "OK"
+        
+        print_progress "Термальный мониторинг" "RUNNING"
+        scan_thermal_cooling
+        print_progress "Термальный мониторинг" "OK"
+        
+        print_progress "Сетевая подсистема" "RUNNING"
+        scan_network_detailed
+        print_progress "Сетевая подсистема" "OK"
+        
+        print_progress "Аудио подсистема" "RUNNING"
+        scan_audio_subsystem
+        print_progress "Аудио подсистема" "OK"
+        
+        print_progress "Анализ логов" "RUNNING"
+        scan_logs_analysis
+        print_progress "Анализ логов" "OK"
+        
+        print_progress "Управление пакетами" "RUNNING"
+        scan_package_management
+        print_progress "Управление пакетами" "OK"
+    fi
+    
+    # === TOTAL LEVEL ===
+    if [[ $SCAN_LEVEL -ge $LEVEL_TOTAL ]]; then
+        print_progress "Аппаратные ошибки" "RUNNING"
+        scan_hardware_errors
+        print_progress "Аппаратные ошибки" "OK"
+        
+        print_progress "Валидация конфигов" "RUNNING"
+        scan_config_validation
+        print_progress "Валидация конфигов" "OK"
+        
+        print_progress "Контейнеры и виртуализация" "RUNNING"
+        scan_containers_virt
+        print_progress "Контейнеры и виртуализация" "OK"
+        
+        print_progress "Безопасность и hardening" "RUNNING"
+        scan_security_hardening
+        print_progress "Безопасность и hardening" "OK"
+    fi
+    
+    # === PROFILING LEVEL ===
+    if [[ $SCAN_LEVEL -ge $LEVEL_PROFILING ]]; then
+        print_progress "Метрики производительности" "RUNNING"
+        scan_performance_metrics
+        print_progress "Метрики производительности" "OK"
+    fi
+    
+    # === FINAL SUMMARY ===
+    print_progress "Генерация итоговой сводки" "RUNNING"
+    generate_ai_summary
+    print_progress "Генерация итоговой сводки" "OK"
+}
+
+#-------------------------------------------------------------------------------
+# ТОЧКА ВХОДА
+#-------------------------------------------------------------------------------
+main() {
+    # Обработка аргументов и получение уровня
+    get_scan_level "$@"
+    
+    # Проверка и установка утилит
+    check_and_install_tools
+    
+    # Определение пути сохранения
+    determine_output_path
+    
+    echo ""
+    echo -e "${COLOR_BLUE}📁 Отчёт будет сохранён в: $TARGET_DIR${COLOR_RESET}"
+    echo ""
+    
+    # Запуск сканирования с перенаправлением вывода в файл
+    run_scan 2>&1 | tee "$OUTPUT_FILE"
+    
+    # Финальная проверка
+    echo ""
+    echo "═══════════════════════════════════════════════════════════"
+    echo "  ✅ Сканирование завершено"
+    echo "═══════════════════════════════════════════════════════════"
+    echo ""
+    
+    if [[ -f "$OUTPUT_FILE" ]]; then
+        local abs_path=$(realpath "$OUTPUT_FILE" 2>/dev/null || echo "$OUTPUT_FILE")
+        local file_size=$(du -h "$OUTPUT_FILE" 2>/dev/null | cut -f1 || echo "unknown")
+        
+        echo -e "${COLOR_GREEN}📄 Отчёт сохранён: $abs_path${COLOR_RESET}"
+        echo -e "${COLOR_GREEN}📊 Размер: $file_size${COLOR_RESET}"
+        echo ""
+        echo "Для анализа передайте файл ИИ с запросом:"
+        echo "  \"Проанализируй системный отчёт, выяви проблемы, дай план устранения\""
+    else
+        echo -e "${COLOR_RED}❌ Ошибка сохранения отчёта${COLOR_RESET}"
+        exit 1
+    fi
+}
+
+# Запуск основной функции
+main "$@"
+
+#===============================================================================
+# @AI_ANALYST_RULES:
+# 1. Все рекомендации должны быть идемпотентными и безопасными при прерывании
+# 2. Если проблема требует перезагрузки / LiveUSB / физического доступа → пометить [REQUIRES_REBOOT] или [NEEDS_PHYSICAL]
+# 3. Не предлагать обновление ядра/драйверов без проверки совместимости с DKMS и установленными пакетами
+# 4. Если данные отсутствуют или обрезаны → указать, какую команду выполнить в read-only режиме для уточнения
+# 5. Приоритет действий: read-only проверка → backup → тест в изоляции → применение в production
+# 6. Для каждой команды указывать: цель, команду, ожидаемый результат, как откатить, уровень риска
+# 7. Ответы на русском, без воды, только факты/риски/команды/откаты
+#===============================================================================
