@@ -59,25 +59,28 @@ trap 'echo -e "\n${COLOR_YELLOW}⚠️ Сканирование прервано
 # ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
 #-------------------------------------------------------------------------------
 
-# safe_cmd - выполнение команды с таймаутом и обработкой ошибок
+# safe_cmd - выполнение команды с таймаутом и обработкой ошибок (от имени root)
 safe_cmd() {
     local timeout_sec=${1:-15}
     shift
-    timeout "$timeout_sec" "$@" 2>/dev/null
+    
+    # Проверяем, есть ли уже sudo в команде, чтобы не дублировать
+    if [[ "$1" == "sudo" ]]; then
+        timeout "$timeout_sec" "$@" 2>/dev/null
+    else
+        # Выполняем команду от имени root через sudo
+        timeout "$timeout_sec" sudo "$@" 2>/dev/null
+    fi
     return $?
 }
 
-# safe_sudo_cmd - выполнение sudo-команды с проверкой прав
+# safe_sudo_cmd - выполнение sudo-команды с проверкой прав (теперь дублирует safe_cmd для совместимости)
 safe_sudo_cmd() {
     local timeout_sec=${1:-15}
     shift
     
-    if ! sudo -n true 2>/dev/null; then
-        echo "[NEEDS_ROOT]"
-        return 1
-    fi
-    
-    timeout "$timeout_sec" sudo "$@" 2>/dev/null
+    # Теперь safe_cmd уже выполняет команды через sudo, поэтому просто вызываем его
+    safe_cmd "$timeout_sec" "$@"
     return $?
 }
 
@@ -218,35 +221,35 @@ install_missing_tools() {
     
     case "$PKG_MGR" in
         apt)
-            install_cmd="sudo apt-get install -y ${tools_to_install[*]}"
+            # Используем safe_cmd для выполнения установки через sudo
+            echo ""
+            echo "📦 Установка пакетов через apt-get..."
+            safe_cmd 300 apt-get install -y "${tools_to_install[@]}"
+            return $?
             ;;
         dnf|yum)
-            install_cmd="sudo dnf install -y ${tools_to_install[*]}"
-            [[ "$PKG_MGR" == "yum" ]] && install_cmd="sudo yum install -y ${tools_to_install[*]}"
+            echo ""
+            echo "📦 Установка пакетов через $PKG_MGR..."
+            safe_cmd 300 "$PKG_MGR" install -y "${tools_to_install[@]}"
+            return $?
             ;;
         pacman)
-            install_cmd="sudo pacman -S --noconfirm ${tools_to_install[*]}"
+            echo ""
+            echo "📦 Установка пакетов через pacman..."
+            safe_cmd 300 pacman -S --noconfirm "${tools_to_install[@]}"
+            return $?
             ;;
         zypper)
-            install_cmd="sudo zypper install -y ${tools_to_install[*]}"
+            echo ""
+            echo "📦 Установка пакетов через zypper..."
+            safe_cmd 300 zypper install -y "${tools_to_install[@]}"
+            return $?
             ;;
         *)
             echo -e "${COLOR_RED}❌ Не удалось определить пакетный менеджер${COLOR_RESET}"
             return 1
             ;;
     esac
-    
-    echo ""
-    echo "📦 Команда установки: $install_cmd"
-    echo ""
-    
-    if eval "$install_cmd"; then
-        echo ""
-        echo -e "${COLOR_GREEN}📦 Установлены пакеты: ${tools_to_install[*]}${COLOR_RESET}"
-        echo "Для удаления выполните: sudo $PKG_MGR remove ${tools_to_install[*]}"
-    else
-        echo -e "${COLOR_RED}❌ Ошибка установки пакетов${COLOR_RESET}"
-    fi
 }
 
 #-------------------------------------------------------------------------------
@@ -1146,7 +1149,15 @@ scan_connected_repositories() {
     echo "• DATA:"
     
     if check_tool docker; then
-        if sudo -n true 2>/dev/null || groups | grep -q docker; then
+        # Проверяем доступ к Docker (sudo или группа docker)
+        local has_docker_access=false
+        if safe_cmd 5 true 2>/dev/null; then
+            has_docker_access=true
+        elif groups | grep -q docker; then
+            has_docker_access=true
+        fi
+        
+        if [[ "$has_docker_access" == "true" ]]; then
             local docker_images=$(safe_cmd 30 docker images --format "{{.Repository}}:{{.Tag}}" 2>/dev/null | head -50 || echo "")
             local docker_containers=$(safe_cmd 15 docker ps -a --format "{{.Names}} ({{.Status}})" 2>/dev/null | head -20 || echo "")
             local docker_volumes=$(safe_cmd 15 docker volume ls --format "{{.Name}}" 2>/dev/null | head -20 || echo "")
@@ -1188,7 +1199,8 @@ scan_connected_repositories() {
     echo "• DATA:"
     
     if check_tool snap; then
-        if sudo -n true 2>/dev/null; then
+        # Проверяем доступ через sudo (snap требует root)
+        if safe_cmd 5 true 2>/dev/null; then
             local snap_list=$(safe_cmd 20 snap list 2>/dev/null | tail -n +2 | head -50 || echo "")
             
             if [[ -n "$snap_list" ]]; then
