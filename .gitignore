@@ -1,1 +1,1 @@
-Nothing needs to be added to .gitignore since only a shell script file (`deep_system_scan_v7.sh`) was added, which is a source code file and should not be ignored.
+Nothing needs to be added to .gitignore since only a shell script file (`deep_system_scan_v7.sh`) was modified, which is a source code file that should not be ignored.
